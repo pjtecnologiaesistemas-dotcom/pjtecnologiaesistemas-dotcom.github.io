@@ -3982,7 +3982,9 @@
     var novo = fts.filter(function(ft) { return ft.id !== id; });
     localStorage.setItem('ft_registros', JSON.stringify(novo));
     if (window.FT_Store)     FT_Store.set('ft_registros', novo);
-    if (window.FT_SyncQueue) FT_SyncQueue.enqueue('set', 'ft_registros', novo);
+    if (window.FT_SyncQueue) FT_SyncQueue.enqueue('set', 'ft_registros', novo).then(function() {
+      if (window.SyncEngine) SyncEngine.flush();
+    });
     renderHistorico();
     renderDashboard();
     showToast('🗑️ Lançamento excluído.', 'success');
@@ -4141,7 +4143,9 @@
     });
     localStorage.setItem('ft_registros', JSON.stringify(fts));
     if (window.FT_Store)     FT_Store.set('ft_registros', fts);
-    if (window.FT_SyncQueue) FT_SyncQueue.enqueue('set', 'ft_registros', fts);
+    if (window.FT_SyncQueue) FT_SyncQueue.enqueue('set', 'ft_registros', fts).then(function() {
+      if (window.SyncEngine) SyncEngine.flush();
+    });
 
     document.getElementById('modalEditFT').classList.remove('show');
     editingFTId = null;
