@@ -7172,6 +7172,15 @@ var FIRESTORE_DOC_ID     = 'dados';
         if (!doc.exists) return;
         var data = doc.data();
 
+        // Marca como online quando onSnapshot recebe dados
+        window._ftFirestoreOnline = true;
+        try {
+          var badge = document.getElementById('ft-online-badge');
+          if (badge) { badge.textContent = '● Online'; badge.style.background = '#26de81'; badge.style.color = '#000'; }
+        } catch(e2) {}
+
+        console.log('[Sync] onSnapshot disparou — campos:', Object.keys(data).join(', '));
+
         // Atualiza localStorage e IndexedDB com dados remotos
         var chavesAtualizadas   = [];
         var escalasAtualizadas  = false;
@@ -7220,36 +7229,43 @@ var FIRESTORE_DOC_ID     = 'dados';
           } catch(e) {}
         }
 
-        // Aplica dados remotos na UI (memória + re-render) para todas as chaves recebidas
-        if (chavesAtualizadas.length > 0 && typeof window._ftAplicarDadosRemotos === 'function') {
-          try { window._ftAplicarDadosRemotos(chavesAtualizadas); } catch(e) {}
-        }
-
         // Recarrega ESCALAS_POSTOS em memória quando escalas ou config chegam do Firestore
-        if (escalasAtualizadas || alertCfgAtualizado) {
-          if (typeof window._ftRecarregarEscalas === 'function') {
-            try { window._ftRecarregarEscalas(); } catch(e) {}
+        // Usa retry porque o módulo de alertas pode ainda não ter carregado
+        function _aplicarRenderAlertas(tentativa) {
+          tentativa = tentativa || 1;
+          var prontos = typeof window._ftRecarregarEscalas === 'function'
+                     && typeof window._ftAlertRender       === 'function'
+                     && typeof window._ftCheckAndAlert     === 'function';
+          if (!prontos && tentativa < 10) {
+            setTimeout(function(){ _aplicarRenderAlertas(tentativa + 1); }, 300);
+            return;
           }
-          // Re-renderiza TODA a UI de alertas para refletir a config remota
-          if (typeof window._ftAlertRender === 'function') {
-            try { window._ftAlertRender(); } catch(e) {}
+          if (escalasAtualizadas || alertCfgAtualizado) {
+            if (typeof window._ftRecarregarEscalas === 'function') {
+              try { window._ftRecarregarEscalas(); } catch(e) {}
+            }
+            if (typeof window._ftAlertRender === 'function') {
+              try { window._ftAlertRender(); } catch(e) {}
+            }
           }
-          if (typeof window.updateHeaderBadge === 'function') {
-            try { window.updateHeaderBadge(); } catch(e) {}
+          if (chavesAtualizadas.length > 0 || escalasAtualizadas || alertCfgAtualizado) {
+            if (typeof window._ftCheckAndAlert === 'function') {
+              try { window._ftCheckAndAlert(); } catch(e) {}
+            } else if (typeof window._ftScheduledCheck === 'function') {
+              try { window._ftScheduledCheck(); } catch(e) {}
+            }
+            if (typeof window.updateHeaderBadge === 'function') {
+              try { window.updateHeaderBadge(); } catch(e) {}
+            }
+            // Re-aplica dados na UI (colaboradores, postos, registros...)
+            if (chavesAtualizadas.length > 0 && typeof window._ftAplicarDadosRemotos === 'function') {
+              try { window._ftAplicarDadosRemotos(chavesAtualizadas); } catch(e) {}
+            }
           }
         }
 
-        // Reavalia alertas imediatamente quando dados mudam
         if (chavesAtualizadas.length > 0 || escalasAtualizadas || alertCfgAtualizado) {
-          setTimeout(function () {
-            if (typeof window._ftCheckAndAlert === 'function') {
-              window._ftCheckAndAlert();
-            } else if (typeof window._ftScheduledCheck === 'function') {
-              window._ftScheduledCheck();
-            } else if (typeof window._ftUpdateBadge === 'function') {
-              window._ftUpdateBadge();
-            }
-          }, 500);
+          setTimeout(function(){ _aplicarRenderAlertas(1); }, 400);
         }
 
         // ft_alert_config já tratado acima junto com ft_escalas_custom
