@@ -7019,6 +7019,9 @@
         try { postos = JSON.parse(localStorage.getItem('ft_postos') || '[]'); } catch(e) {}
         atualizou.postos = true;
       }
+      // ft_registros e ft_bico_fixo são lidos diretamente do localStorage
+      // pelas funções getFTs() / getBicos() no momento da renderização — não
+      // precisam ser guardados em variável de módulo. Basta marcar para re-render.
       if (key === 'ft_registros') atualizou.registros = true;
       if (key === 'ft_bico_fixo')  atualizou.bico      = true;
       if (key === 'ft_horarios_custom') atualizou.horarios = true;
@@ -7168,8 +7171,12 @@ var FIRESTORE_DOC_ID     = 'dados';
     // ── Listener em tempo real (recebe mudanças de outros dispositivos) ──
     db.collection(FIRESTORE_COLLECTION)
       .doc(FIRESTORE_DOC_ID)
-      .onSnapshot(function (doc) {
+      .onSnapshot({ includeMetadataChanges: true }, function (doc) {
         if (!doc.exists) return;
+        // Ignora snapshots de escrita local pendente (ainda não confirmada pelo servidor).
+        // Isso evita re-processar dados que o próprio dispositivo acabou de gravar.
+        if (doc.metadata.hasPendingWrites) return;
+
         var data = doc.data();
 
         // Marca como online quando onSnapshot recebe dados
@@ -7265,7 +7272,9 @@ var FIRESTORE_DOC_ID     = 'dados';
         }
 
         if (chavesAtualizadas.length > 0 || escalasAtualizadas || alertCfgAtualizado) {
-          setTimeout(function(){ _aplicarRenderAlertas(1); }, 400);
+          // localStorage.setItem é síncrono — não precisa de delay.
+          // Usamos setTimeout(0) apenas para ceder o event loop antes de re-renderizar.
+          setTimeout(function(){ _aplicarRenderAlertas(1); }, 0);
         }
 
         // ft_alert_config já tratado acima junto com ft_escalas_custom
