@@ -3182,6 +3182,13 @@
     flush: function() {
       var self = this;
       if (self._syncing || !self._online) return Promise.resolve();
+
+      // ── Se o Firebase ainda não registrou o handler remoto,
+      //    adia o flush em vez de esvaziar a fila silenciosamente.
+      //    O Firebase chama flush() logo após setRemote(), garantindo
+      //    que a fila seja drenada assim que o SDK conectar.
+      if (!self._remoteHandler) return Promise.resolve();
+
       self._syncing = true;
       self.updateStatus('syncing');
 
@@ -7138,6 +7145,13 @@ var FIRESTORE_DOC_ID     = 'dados';
             return false; // mantém na fila para tentar depois
           });
       });
+
+      // ── Flush imediato: drena tudo que foi enfileirado enquanto
+      //    o SDK Firebase ainda estava carregando via CDN. Sem isto,
+      //    lançamentos feitos antes do Firebase conectar ficavam presos
+      //    na fila IndexedDB e nunca chegavam ao Firestore.
+      console.log('[FirebaseSync] Handler registrado — drenando fila pendente…');
+      SyncEngine.flush();
     }
 
     // ── Bridge de escrita: saveConfig chama esta função após Firebase conectar ──
