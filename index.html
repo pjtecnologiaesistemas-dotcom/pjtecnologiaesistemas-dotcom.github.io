@@ -6,7 +6,7 @@
 <title>Nova Folga Trabalhada (FT)</title>
 
 <!-- ── PWA ── -->
-<link rel="manifest" href="manifest.json">
+<link rel="manifest" href="/Novafolgatrabalhada2/manifest.json">
 <meta name="theme-color" content="#f7b731">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-capable" content="yes">
@@ -16,7 +16,7 @@
   if ('serviceWorker' in navigator) {
     window.addEventListener('load', function() {
       // Registra o SW principal (PWA + cache)
-      navigator.serviceWorker.register('./service-worker.js')
+      navigator.serviceWorker.register('/Novafolgatrabalhada2/service-worker.js')
         .then(function(reg) { console.log('[SW] Registrado:', reg.scope); })
         .catch(function(err) { console.warn('[SW] Falhou:', err); });
     });
@@ -3281,7 +3281,14 @@
     try { localStorage.setItem(key, JSON.stringify(data)); } catch(e) {}
     // Grava também no IndexedDB e enfileira sync
     if (window.FT_Store) FT_Store.set(key, data);
-    if (window.FT_SyncQueue) FT_SyncQueue.enqueue('set', key, data);
+    if (window.FT_SyncQueue) {
+      FT_SyncQueue.enqueue('set', key, data).then(function() {
+        // Dispara o envio imediatamente (antes a alteração só era enviada
+        // na próxima ação que chamasse flush(), atrasando a sincronização
+        // de colaboradores/postos entre dispositivos)
+        if (window.SyncEngine) SyncEngine.flush();
+      });
+    }
   }
 
   // ── Estado global ───────────────────────────────
@@ -3982,9 +3989,7 @@
     var novo = fts.filter(function(ft) { return ft.id !== id; });
     localStorage.setItem('ft_registros', JSON.stringify(novo));
     if (window.FT_Store)     FT_Store.set('ft_registros', novo);
-    if (window.FT_SyncQueue) FT_SyncQueue.enqueue('set', 'ft_registros', novo).then(function() {
-      if (window.SyncEngine) SyncEngine.flush();
-    });
+    if (window.FT_SyncQueue) FT_SyncQueue.enqueue('set', 'ft_registros', novo);
     renderHistorico();
     renderDashboard();
     showToast('🗑️ Lançamento excluído.', 'success');
@@ -4143,9 +4148,7 @@
     });
     localStorage.setItem('ft_registros', JSON.stringify(fts));
     if (window.FT_Store)     FT_Store.set('ft_registros', fts);
-    if (window.FT_SyncQueue) FT_SyncQueue.enqueue('set', 'ft_registros', fts).then(function() {
-      if (window.SyncEngine) SyncEngine.flush();
-    });
+    if (window.FT_SyncQueue) FT_SyncQueue.enqueue('set', 'ft_registros', fts);
 
     document.getElementById('modalEditFT').classList.remove('show');
     editingFTId = null;
@@ -7023,9 +7026,6 @@
         try { postos = JSON.parse(localStorage.getItem('ft_postos') || '[]'); } catch(e) {}
         atualizou.postos = true;
       }
-      // ft_registros e ft_bico_fixo são lidos diretamente do localStorage
-      // pelas funções getFTs() / getBicos() no momento da renderização — não
-      // precisam ser guardados em variável de módulo. Basta marcar para re-render.
       if (key === 'ft_registros') atualizou.registros = true;
       if (key === 'ft_bico_fixo')  atualizou.bico      = true;
       if (key === 'ft_horarios_custom') atualizou.horarios = true;
@@ -7175,22 +7175,9 @@ var FIRESTORE_DOC_ID     = 'dados';
     // ── Listener em tempo real (recebe mudanças de outros dispositivos) ──
     db.collection(FIRESTORE_COLLECTION)
       .doc(FIRESTORE_DOC_ID)
-      .onSnapshot({ includeMetadataChanges: true }, function (doc) {
+      .onSnapshot(function (doc) {
         if (!doc.exists) return;
-        // Ignora snapshots de escrita local pendente (ainda não confirmada pelo servidor).
-        // Isso evita re-processar dados que o próprio dispositivo acabou de gravar.
-        if (doc.metadata.hasPendingWrites) return;
-
         var data = doc.data();
-
-        // Marca como online quando onSnapshot recebe dados
-        window._ftFirestoreOnline = true;
-        try {
-          var badge = document.getElementById('ft-online-badge');
-          if (badge) { badge.textContent = '● Online'; badge.style.background = '#26de81'; badge.style.color = '#000'; }
-        } catch(e2) {}
-
-        console.log('[Sync] onSnapshot disparou — campos:', Object.keys(data).join(', '));
 
         // Atualiza localStorage e IndexedDB com dados remotos
         var chavesAtualizadas   = [];
@@ -7240,45 +7227,36 @@ var FIRESTORE_DOC_ID     = 'dados';
           } catch(e) {}
         }
 
+        // Aplica dados remotos na UI (memória + re-render) para todas as chaves recebidas
+        if (chavesAtualizadas.length > 0 && typeof window._ftAplicarDadosRemotos === 'function') {
+          try { window._ftAplicarDadosRemotos(chavesAtualizadas); } catch(e) {}
+        }
+
         // Recarrega ESCALAS_POSTOS em memória quando escalas ou config chegam do Firestore
-        // Usa retry porque o módulo de alertas pode ainda não ter carregado
-        function _aplicarRenderAlertas(tentativa) {
-          tentativa = tentativa || 1;
-          var prontos = typeof window._ftRecarregarEscalas === 'function'
-                     && typeof window._ftAlertRender       === 'function'
-                     && typeof window._ftCheckAndAlert     === 'function';
-          if (!prontos && tentativa < 10) {
-            setTimeout(function(){ _aplicarRenderAlertas(tentativa + 1); }, 300);
-            return;
+        if (escalasAtualizadas || alertCfgAtualizado) {
+          if (typeof window._ftRecarregarEscalas === 'function') {
+            try { window._ftRecarregarEscalas(); } catch(e) {}
           }
-          if (escalasAtualizadas || alertCfgAtualizado) {
-            if (typeof window._ftRecarregarEscalas === 'function') {
-              try { window._ftRecarregarEscalas(); } catch(e) {}
-            }
-            if (typeof window._ftAlertRender === 'function') {
-              try { window._ftAlertRender(); } catch(e) {}
-            }
+          // Re-renderiza TODA a UI de alertas para refletir a config remota
+          if (typeof window._ftAlertRender === 'function') {
+            try { window._ftAlertRender(); } catch(e) {}
           }
-          if (chavesAtualizadas.length > 0 || escalasAtualizadas || alertCfgAtualizado) {
-            if (typeof window._ftCheckAndAlert === 'function') {
-              try { window._ftCheckAndAlert(); } catch(e) {}
-            } else if (typeof window._ftScheduledCheck === 'function') {
-              try { window._ftScheduledCheck(); } catch(e) {}
-            }
-            if (typeof window.updateHeaderBadge === 'function') {
-              try { window.updateHeaderBadge(); } catch(e) {}
-            }
-            // Re-aplica dados na UI (colaboradores, postos, registros...)
-            if (chavesAtualizadas.length > 0 && typeof window._ftAplicarDadosRemotos === 'function') {
-              try { window._ftAplicarDadosRemotos(chavesAtualizadas); } catch(e) {}
-            }
+          if (typeof window.updateHeaderBadge === 'function') {
+            try { window.updateHeaderBadge(); } catch(e) {}
           }
         }
 
+        // Reavalia alertas imediatamente quando dados mudam
         if (chavesAtualizadas.length > 0 || escalasAtualizadas || alertCfgAtualizado) {
-          // localStorage.setItem é síncrono — não precisa de delay.
-          // Usamos setTimeout(0) apenas para ceder o event loop antes de re-renderizar.
-          setTimeout(function(){ _aplicarRenderAlertas(1); }, 0);
+          setTimeout(function () {
+            if (typeof window._ftCheckAndAlert === 'function') {
+              window._ftCheckAndAlert();
+            } else if (typeof window._ftScheduledCheck === 'function') {
+              window._ftScheduledCheck();
+            } else if (typeof window._ftUpdateBadge === 'function') {
+              window._ftUpdateBadge();
+            }
+          }, 500);
         }
 
         // ft_alert_config já tratado acima junto com ft_escalas_custom
@@ -7849,6 +7827,17 @@ var FIRESTORE_DOC_ID     = 'dados';
       } else {
         // Firebase ainda não conectou — guarda para enviar assim que conectar
         window._ftAlertConfigPending = cfg;
+      }
+      // Reforço de durabilidade: também enfileira no IndexedDB (mesma fila usada
+      // por colaboradores/postos/registros). Diferente da variável "_ftAlertConfigPending"
+      // (perdida se a aba fechar antes de reconectar), a fila persiste e é
+      // reenviada automaticamente no próximo flush/abertura do app — corrige
+      // o caso de a config de alertas ficar "presa" sem sincronizar quando
+      // salva sem conexão.
+      if (window.FT_SyncQueue) {
+        FT_SyncQueue.enqueue('set', LS_CONFIG, cfg).then(function() {
+          if (window.SyncEngine) SyncEngine.flush();
+        });
       }
     }
   }
@@ -8427,6 +8416,14 @@ var FIRESTORE_DOC_ID     = 'dados';
     } else {
       // Firebase ainda não conectou — enfileira para envio posterior
       window._ftEscalaCustomPending = loadEscalasCustom();
+    }
+    // Reforço de durabilidade (mesma fila do IndexedDB usada para os demais
+    // dados): garante reenvio automático mesmo se a aba fechar offline antes
+    // do envio direto acima ser concluído.
+    if (window.FT_SyncQueue) {
+      FT_SyncQueue.enqueue('set', 'ft_escalas_custom', custom).then(function() {
+        if (window.SyncEngine) SyncEngine.flush();
+      });
     }
   }
 
@@ -9174,14 +9171,24 @@ var FIRESTORE_DOC_ID     = 'dados';
   };
 
   // Expõe render ao window para o listener Firestore atualizar a UI
+  // IMPORTANTE: encadeia com a versão já definida (módulo de escalas/cadastros)
+  // em vez de sobrescrevê-la — antes isso descartava renderConfigPeriodos,
+  // renderCadAlertasToggles e updateHeaderBadge, fazendo a UI de alertas
+  // não refletir totalmente os dados sincronizados de outros dispositivos.
+  var _ftAlertRenderAnterior = window._ftAlertRender;
   window._ftAlertRender = function () {
+    if (typeof _ftAlertRenderAnterior === 'function') { try { _ftAlertRenderAnterior(); } catch(e) {} }
     if (typeof renderConfigPostos          === 'function') renderConfigPostos();
     if (typeof renderCadAlertasPostos      === 'function') renderCadAlertasPostos();
     if (typeof renderBicoPostosMonitorados === 'function') renderBicoPostosMonitorados();
   };
 
   // Expõe recarga de escalas para o onSnapshot recarregar ESCALAS_POSTOS em memória
+  // Mesma correção: encadeia em vez de sobrescrever (preserva renderEscalaSelectPostos
+  // e updateHeaderBadge definidos na versão anterior).
+  var _ftRecarregarEscalasAnterior = window._ftRecarregarEscalas;
   window._ftRecarregarEscalas = function () {
+    if (typeof _ftRecarregarEscalasAnterior === 'function') { try { _ftRecarregarEscalasAnterior(); } catch(e) {} }
     if (typeof carregarEscalasCustomNaMemoria === 'function') {
       carregarEscalasCustomNaMemoria();
     }
