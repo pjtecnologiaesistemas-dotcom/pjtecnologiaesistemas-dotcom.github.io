@@ -18,7 +18,11 @@ firebase.initializeApp(firebaseConfig);
 const messaging = firebase.messaging();
 
 // ── Nome do cache ───────────────────────────────────────────────────────────
-const CACHE_NAME = 'ft-app-v3-push';
+const CACHE_NAME = 'ft-app-v4-network-first';
+// IMPORTANTE: troque este nome (ex.: v4 → v5) a cada deploy em que você
+// alterar o index.html. Isso garante que o passo "activate" abaixo limpe
+// o cache antigo mesmo se, por algum motivo, a estratégia network-first
+// não conseguir buscar a rede a tempo.
 
 // ── Instalação ──────────────────────────────────────────────────────────────
 self.addEventListener('install', function(event) {
@@ -117,7 +121,7 @@ self.addEventListener('notificationclick', function(event) {
   );
 });
 
-// ── Cache offline-first ─────────────────────────────────────────────────────
+// ── Cache: network-first para o HTML, cache-first para o resto ─────────────
 self.addEventListener('fetch', function(event) {
   // Ignora requisições não-GET e requests cross-origin do Firebase/CDN
   if (event.request.method !== 'GET') return;
@@ -126,6 +130,37 @@ self.addEventListener('fetch', function(event) {
   if (url.indexOf('gstatic.com') !== -1) return;
   if (url.indexOf('googleapis.com') !== -1) return;
 
+  // ── Documento principal (index.html / navegação) → NETWORK-FIRST ──────
+  // CRÍTICO: antes era cache-first ("return cached || fetchPromise"), o
+  // que fazia o app instalado como PWA devolver SEMPRE a cópia antiga do
+  // index.html guardada no cache, mesmo com internet disponível — a busca
+  // na rede só atualizava o cache para a PRÓXIMA visita, nunca para a
+  // atual. Combinado com o CACHE_NAME fixo (nunca mudava entre deploys),
+  // isso travava o app instalado numa versão antiga indefinidamente,
+  // mesmo depois de publicar correções de sincronização. Agora, sempre
+  // que há conexão, busca a versão mais recente na rede primeiro; só cai
+  // para o cache se a rede falhar (modo offline real).
+  var isDocumento = event.request.mode === 'navigate' ||
+                     event.request.destination === 'document' ||
+                     url.indexOf('index.html') !== -1;
+
+  if (isDocumento) {
+    event.respondWith(
+      fetch(event.request).then(function(response) {
+        if (response && response.status === 200) {
+          var clone = response.clone();
+          caches.open(CACHE_NAME).then(function(cache) { cache.put(event.request, clone); });
+        }
+        return response;
+      }).catch(function() {
+        // Offline de verdade: usa a última cópia salva como fallback
+        return caches.match(event.request);
+      })
+    );
+    return;
+  }
+
+  // ── Demais assets (ícones, manifest etc.) → cache-first (mudam raramente) ──
   event.respondWith(
     caches.match(event.request).then(function(cached) {
       var fetchPromise = fetch(event.request).then(function(response) {
