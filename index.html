@@ -3996,7 +3996,9 @@
     var novo = fts.filter(function(ft) { return ft.id !== id; });
     localStorage.setItem('ft_registros', JSON.stringify(novo));
     if (window.FT_Store)     FT_Store.set('ft_registros', novo);
-    if (window.FT_SyncQueue) FT_SyncQueue.enqueue('set', 'ft_registros', novo);
+    if (window.FT_SyncQueue) FT_SyncQueue.enqueue('set', 'ft_registros', novo).then(function() {
+      if (window.SyncEngine) SyncEngine.flush();
+    });
     renderHistorico();
     renderDashboard();
     showToast('🗑️ Lançamento excluído.', 'success');
@@ -4155,7 +4157,9 @@
     });
     localStorage.setItem('ft_registros', JSON.stringify(fts));
     if (window.FT_Store)     FT_Store.set('ft_registros', fts);
-    if (window.FT_SyncQueue) FT_SyncQueue.enqueue('set', 'ft_registros', fts);
+    if (window.FT_SyncQueue) FT_SyncQueue.enqueue('set', 'ft_registros', fts).then(function() {
+      if (window.SyncEngine) SyncEngine.flush();
+    });
 
     document.getElementById('modalEditFT').classList.remove('show');
     editingFTId = null;
@@ -7163,6 +7167,8 @@ var FIRESTORE_DOC_ID     = 'dados';
       //    o SDK Firebase ainda estava carregando via CDN. Sem isto,
       //    lançamentos feitos antes do Firebase conectar ficavam presos
       //    na fila IndexedDB e nunca chegavam ao Firestore.
+      // Garante que _online=true pois Firebase só inicializa com conexão ativa
+      SyncEngine._online = navigator.onLine;
       console.log('[FirebaseSync] Handler registrado — drenando fila pendente…');
       SyncEngine.flush();
     }
