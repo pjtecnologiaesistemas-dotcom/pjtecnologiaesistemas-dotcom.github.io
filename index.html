@@ -7109,9 +7109,22 @@ var FIRESTORE_DOC_ID     = 'dados';
   'use strict';
 
   // Carrega o SDK Firebase via CDN
-  function loadScript(src, cb) {
+  // CRÍTICO: tem onerror + 1 retry — sem isso, uma falha de rede em QUALQUER
+  // script da cadeia (ex.: CDN bloqueado por ad-blocker) travava o
+  // encadeamento para sempre e o app nunca conectava ao Firestore,
+  // mesmo sem nenhum erro visível no console do usuário.
+  function loadScript(src, cb, _isRetry) {
     var s = document.createElement('script');
-    s.src = src; s.onload = cb;
+    s.src = src;
+    s.onload = cb;
+    s.onerror = function () {
+      if (_isRetry) {
+        console.warn('[FirebaseSync] Falha definitiva ao carregar script:', src);
+        return; // desiste após 1 retry — não bloqueia o resto do app
+      }
+      console.warn('[FirebaseSync] Falha ao carregar script, tentando novamente:', src);
+      setTimeout(function () { loadScript(src, cb, true); }, 1500);
+    };
     document.head.appendChild(s);
   }
 
@@ -7283,17 +7296,43 @@ var FIRESTORE_DOC_ID     = 'dados';
         console.warn('[FirebaseSync] Listener error:', err);
       });
 
+    window._ftFirebaseConectado = true;
     console.log('[FirebaseSync] ✅ Conectado ao Firestore:', FIREBASE_CONFIG.projectId);
   }
 
-  // Carrega SDKs do Firebase em sequência e inicializa (inclui Messaging para FCM)
-  loadScript('https://www.gstatic.com/firebasejs/9.22.2/firebase-app-compat.js', function () {
-    loadScript('https://www.gstatic.com/firebasejs/9.22.2/firebase-firestore-compat.js', function () {
-      loadScript('https://www.gstatic.com/firebasejs/9.22.2/firebase-messaging-compat.js', function () {
+  // ── Permite forçar uma (re)conexão real, usada pelo botão de Diagnóstico
+  //    quando o SDK ainda não carregou ou o listener nunca conectou ──
+  window._ftReconectarFirebase = function () {
+    if (window._ftFirebaseConectado) return; // já conectado, nada a fazer
+    iniciarCarregamento();
+  };
+
+  function iniciarCarregamento() {
+    // Carrega SDKs do Firebase em sequência e inicializa.
+    // CRÍTICO: initFirebase() (que liga o listener onSnapshot em tempo real)
+    // NÃO depende mais do SDK de Messaging. Antes, a cadeia era:
+    //   app-compat → firestore-compat → messaging-compat → initFirebase()
+    // Se o script de Messaging falhasse ao carregar (comum: bloqueado por
+    // ad-blocker/uBlock/Brave, que tratam "firebase-messaging" como rastreador),
+    // o callback nunca disparava e initFirebase() NUNCA era chamado — ou seja,
+    // o listener em tempo real nunca era criado e a sincronização automática
+    // entre dispositivos simplesmente não existia, em silêncio, sem nenhum
+    // erro visível (o botão de Diagnóstico funcionava porque chama
+    // firebase.firestore() direto, sem depender dessa cadeia).
+    // Agora Messaging carrega em paralelo, de forma best-effort, e nunca
+    // bloqueia a conexão real ao Firestore.
+    loadScript('https://www.gstatic.com/firebasejs/9.22.2/firebase-app-compat.js', function () {
+      loadScript('https://www.gstatic.com/firebasejs/9.22.2/firebase-firestore-compat.js', function () {
         initFirebase();
+        // Messaging (push) é opcional — carrega em paralelo, sem travar o sync
+        loadScript('https://www.gstatic.com/firebasejs/9.22.2/firebase-messaging-compat.js', function () {
+          if (typeof window._ftMessagingReady === 'function') window._ftMessagingReady();
+        });
       });
     });
-  });
+  }
+
+  iniciarCarregamento();
 }());
 
 </script>
@@ -7378,32 +7417,53 @@ var FIRESTORE_DOC_ID     = 'dados';
     } catch(e) { console.warn('[FCM] initPushNotifications error:', e); }
   }
 
-  // Hook: após o módulo de alertas expor _ftCheckAndAlert, wrappeia para disparar push
+  // Hook: após o módulo de alertas expor _ftCheckAndAlert, wrappeia para disparar push.
+  // CRÍTICO: guarda o nome original em vez de capturar a função por valor.
+  // Antes, "var orig = window._ftCheckAndAlert" podia capturar undefined se
+  // o módulo de alertas ainda não tivesse rodado seu init() — e o módulo de
+  // alertas, ao rodar depois, sobrescrevia window._ftCheckAndAlert de volta
+  // para a versão sem push, descartando este wrapper silenciosamente.
   function hookAlertModule() {
-    var orig = window._ftCheckAndAlert;
-    window._ftCheckAndAlert = function() {
-      if (typeof orig === 'function') orig();
+    if (window._ftCheckAndAlertOriginal) return; // já hookeado
+    window._ftCheckAndAlertOriginal = true;
+    var realFn = (typeof window._ftCheckAndAlert === 'function') ? window._ftCheckAndAlert : null;
+    Object.defineProperty(window, '_ftCheckAndAlert', {
+      configurable: true,
+      get: function () { return wrapped; },
+      set: function (fn) { realFn = fn; }
+    });
+    function wrapped() {
+      if (typeof realFn === 'function') realFn();
       // Dispara push local se há pendências
-      setTimeout(function() {
+      setTimeout(function () {
         try {
           if (typeof window._ftGetPendencias === 'function') {
             var p = window._ftGetPendencias();
             if (p && p.length) triggerPushForPendencias(p);
           }
-        } catch(e) {}
+        } catch (e) {}
       }, 600);
-    };
+    }
   }
 
   // Aguarda Firebase carregar e então inicializa FCM
   function waitFirebaseAndInit() {
     if (typeof firebase !== 'undefined' && firebase.apps && firebase.apps.length) {
-      setTimeout(initPushNotifications, 800);
       hookAlertModule();
+      if (firebase.messaging) setTimeout(initPushNotifications, 800);
+      // Se o messaging ainda não carregou, window._ftMessagingReady (chamado
+      // pelo módulo Firebase Sync quando o SDK de messaging terminar de
+      // carregar, em paralelo) dispara initPushNotifications depois.
     } else {
       setTimeout(waitFirebaseAndInit, 500);
     }
   }
+
+  // Chamado pelo módulo Firebase Sync quando firebase-messaging-compat.js
+  // termina de carregar (agora carrega em paralelo, pode chegar depois).
+  window._ftMessagingReady = function () {
+    setTimeout(initPushNotifications, 300);
+  };
 
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', function(){ setTimeout(waitFirebaseAndInit, 1000); });
@@ -9223,7 +9283,19 @@ function toggleAcc(id) {
   el.classList.toggle('open', !isOpen);
 }
 
-/* ══ DIAGNÓSTICO & FORÇA-SYNC de Postos Monitorados ══ */
+/* ══════════════════════════════════════════════════════════
+   DIAGNÓSTICO & FORÇA-SYNC — sincronização manual completa
+   Cobre TODOS os dados do app (não só a config de alertas):
+   ft_registros, ft_colaboradores, ft_postos, ft_bico_fixo,
+   ft_horarios_custom, ft_escalas_custom, ft_alert_config.
+   Estratégia: MESCLA POR UNIÃO — nunca descarta um registro que
+   existe só local ou só remoto. Em caso de conflito (mesmo id em
+   ambos com conteúdo diferente), a versão do Firestore prevalece
+   (assume-se que outro dispositivo pode ter editado por último),
+   mas nada que exista em apenas um dos lados é perdido.
+   Ao final, grava o resultado mesclado nos dois lados e
+   re-renderiza toda a UI — sem precisar recarregar a página.
+   ══════════════════════════════════════════════════════════ */
 window.diagSync = function () {
   var log = document.getElementById('diag-sync-log');
   if (!log) return;
@@ -9236,96 +9308,160 @@ window.diagSync = function () {
     log.appendChild(d);
     log.scrollTop = log.scrollHeight;
   }
-  line('▶ Iniciando diagnóstico...', '#00c8f8');
+
+  // Mescla duas listas de objetos por "id", sem perder itens exclusivos
+  // de nenhum dos lados. Em conflito (mesmo id, conteúdo diferente),
+  // a versão remota prevalece.
+  function mergeListas(local, remoto) {
+    local  = Array.isArray(local)  ? local  : [];
+    remoto = Array.isArray(remoto) ? remoto : [];
+    var porId = {};
+    var semId = []; // itens sem campo "id" são mantidos por igualdade de conteúdo
+    local.forEach(function (item) {
+      if (item && item.id !== undefined && item.id !== null) porId[item.id] = item;
+      else semId.push(item);
+    });
+    remoto.forEach(function (item) {
+      if (item && item.id !== undefined && item.id !== null) porId[item.id] = item; // remoto sobrescreve em conflito
+      else {
+        var jaExiste = semId.some(function (s) { return JSON.stringify(s) === JSON.stringify(item); });
+        if (!jaExiste) semId.push(item);
+      }
+    });
+    var resultado = Object.keys(porId).map(function (k) { return porId[k]; }).concat(semId);
+    return resultado;
+  }
+
+  // Mescla dois objetos chave→valor (ex.: ft_escalas_custom) por união de chaves
+  function mergeMapas(local, remoto) {
+    var out = {};
+    if (local  && typeof local  === 'object') for (var k1 in local)  out[k1] = local[k1];
+    if (remoto && typeof remoto === 'object') for (var k2 in remoto) out[k2] = remoto[k2]; // remoto prevalece em conflito
+    return out;
+  }
+
+  // Mescla a config de alertas: une postos e os mapas internos,
+  // mantém os flags booleanos do lado remoto quando definidos.
+  function mergeAlertConfig(local, remoto) {
+    local  = local  || {};
+    remoto = remoto || {};
+    var postosLocal  = Array.isArray(local.postos)  ? local.postos  : [];
+    var postosRemoto = Array.isArray(remoto.postos) ? remoto.postos : [];
+    var postosUnidos = postosLocal.slice();
+    postosRemoto.forEach(function (p) { if (postosUnidos.indexOf(p) === -1) postosUnidos.push(p); });
+    return {
+      postos:              postosUnidos,
+      alertarDia:          (typeof remoto.alertarDia   === 'boolean') ? remoto.alertarDia   : (local.alertarDia   !== false),
+      alertarNoite:        (typeof remoto.alertarNoite === 'boolean') ? remoto.alertarNoite : (local.alertarNoite !== false),
+      postosInativos:      mergeMapas(local.postosInativos,      remoto.postosInativos),
+      postosTurnoInativo:  mergeMapas(local.postosTurnoInativo,  remoto.postosTurnoInativo),
+      postosEscalaDia:     mergeMapas(local.postosEscalaDia,     remoto.postosEscalaDia)
+    };
+  }
+
+  function lerLocal(key, isMapa) {
+    try { return JSON.parse(localStorage.getItem(key) || (isMapa ? '{}' : '[]')); }
+    catch (e) { return isMapa ? {} : []; }
+  }
+
+  function gravarLocal(key, valor) {
+    try { localStorage.setItem(key, JSON.stringify(valor)); } catch (e) {}
+    if (window.FT_Store) { try { FT_Store.set(key, valor); } catch (e) {} }
+  }
+
+  line('▶ Iniciando diagnóstico e sincronização completa...', '#00c8f8');
+
   if (typeof firebase === 'undefined') {
-    line('❌ firebase SDK NÃO carregado!', '#fc5c65'); return;
+    line('❌ firebase SDK NÃO carregado! Verifique sua conexão.', '#fc5c65');
+    line('🔁 Tentando reconectar...', '#f7b731');
+    if (typeof window._ftReconectarFirebase === 'function') window._ftReconectarFirebase();
+    return;
   }
   line('✅ firebase SDK carregado', '#26de81');
+
   var db;
   try { db = firebase.firestore(); line('✅ firestore() OK', '#26de81'); }
-  catch(e) { line('❌ firestore() falhou: ' + e.message, '#fc5c65'); return; }
+  catch (e) { line('❌ firestore() falhou: ' + e.message, '#fc5c65'); return; }
+
   if (typeof window._ftAlertConfigSync === 'function') {
-    line('✅ bridge _ftAlertConfigSync presente', '#26de81');
+    line('✅ Listener em tempo real conectado', '#26de81');
   } else {
-    line('⚠️ bridge _ftAlertConfigSync AUSENTE — Firebase ainda não conectou', '#f7b731');
+    line('⚠️ Listener em tempo real ainda não conectou — sincronizando mesmo assim', '#f7b731');
   }
-  var cfgLocal = null;
-  try {
-    cfgLocal = JSON.parse(localStorage.getItem('ft_alert_config') || 'null');
-    if (cfgLocal) {
-      line('✅ Config local: ' + (cfgLocal.postos||[]).length + ' posto(s): ' + (cfgLocal.postos||[]).join(', '), '#26de81');
-    } else {
-      line('⚠️ Config local VAZIA', '#f7b731');
-    }
-  } catch(e) { line('❌ Erro ao ler config local: ' + e.message, '#fc5c65'); }
+
   var COL = window.FIRESTORE_COLLECTION || 'folga_trabalhada';
   var DOC = window.FIRESTORE_DOC_ID     || 'dados';
+
+  var LISTAS = ['ft_registros', 'ft_colaboradores', 'ft_postos', 'ft_bico_fixo', 'ft_horarios_custom'];
+  var MAPA   = 'ft_escalas_custom';
+  var CFG    = 'ft_alert_config';
+
   line('🔍 Lendo ' + COL + '/' + DOC + ' no Firestore...', '#00c8f8');
   db.collection(COL).doc(DOC).get()
-    .then(function(snap) {
-      if (!snap.exists) {
-        line('⚠️ Documento não existe no Firestore ainda', '#f7b731');
-        if (cfgLocal) {
-          line('🚀 Criando documento com config local...', '#00c8f8');
-          return db.collection(COL).doc(DOC).set({ ft_alert_config: cfgLocal }, { merge: true });
+    .then(function (snap) {
+      var data = snap.exists ? (snap.data() || {}) : {};
+      if (!snap.exists) line('⚠️ Documento ainda não existe no Firestore — será criado agora', '#f7b731');
+
+      var upd = {};
+      var mudouLocal = [];
+
+      // ── Mescla cada lista (registros, colaboradores, postos, bico, horários) ──
+      LISTAS.forEach(function (key) {
+        var local  = lerLocal(key, false);
+        var remoto = Array.isArray(data[key]) ? data[key] : [];
+        var mesclado = mergeListas(local, remoto);
+        var mudou = JSON.stringify(mesclado.slice().sort(function(a,b){return (a&&a.id>b&&b.id)?1:-1;}))
+                 !== JSON.stringify(remoto.slice().sort(function(a,b){return (a&&a.id>b&&b.id)?1:-1;}));
+        upd[key] = mesclado;
+        if (mesclado.length !== local.length || mudou) {
+          gravarLocal(key, mesclado);
+          mudouLocal.push(key);
         }
-        return;
-      }
-      var data = snap.data();
+        line('🔀 ' + key + ': local=' + local.length + ' remoto=' + remoto.length + ' → mesclado=' + mesclado.length, '#26de81');
+      });
 
-      // Mostra config do Firestore
-      if (data.ft_alert_config) {
-        var postosFs = (data.ft_alert_config.postos || []);
-        line('☁️ Firestore ft_alert_config: ' + postosFs.length + ' posto(s): ' + postosFs.join(', '), '#26de81');
-      } else {
-        line('⚠️ Firestore NÃO tem ft_alert_config', '#f7b731');
-      }
-      if (data.ft_escalas_custom) {
-        line('☁️ Firestore ft_escalas_custom: ' + Object.keys(data.ft_escalas_custom).length + ' posto(s) com escala', '#26de81');
-      }
+      // ── Mescla escalas customizadas ──
+      var escLocal  = lerLocal(MAPA, true);
+      var escRemoto = (data[MAPA] && typeof data[MAPA] === 'object') ? data[MAPA] : {};
+      var escMesclado = mergeMapas(escLocal, escRemoto);
+      upd[MAPA] = escMesclado;
+      gravarLocal(MAPA, escMesclado);
+      line('🔀 ' + MAPA + ': ' + Object.keys(escMesclado).length + ' posto(s) com escala customizada', '#26de81');
 
-      // Decide direção da sincronização:
-      // Se Firestore tem mais postos → puxa do Firestore (prioridade remota)
-      // Caso contrário → envia local para o Firestore
-      var postosLocal = (cfgLocal && cfgLocal.postos) ? cfgLocal.postos : [];
-      var postosRemoto = (data.ft_alert_config && data.ft_alert_config.postos) ? data.ft_alert_config.postos : [];
+      // ── Mescla config de alertas ──
+      var cfgLocal  = lerLocal(CFG, true);
+      var cfgRemoto = (data[CFG] && typeof data[CFG] === 'object') ? data[CFG] : {};
+      var cfgMesclado = mergeAlertConfig(cfgLocal, cfgRemoto);
+      upd[CFG] = cfgMesclado;
+      window._ftApplyingRemote = true;
+      gravarLocal(CFG, cfgMesclado);
+      window._ftApplyingRemote = false;
+      line('🔀 ' + CFG + ': ' + cfgMesclado.postos.length + ' posto(s) monitorado(s): ' + cfgMesclado.postos.join(', '), '#26de81');
 
-      if (postosRemoto.length >= postosLocal.length && data.ft_alert_config) {
-        line('⬇️ Aplicando config do Firestore neste dispositivo...', '#00c8f8');
-        // Aplica config remota localmente SEM re-publicar no Firestore
-        window._ftApplyingRemote = true;
-        try { localStorage.setItem('ft_alert_config', JSON.stringify(data.ft_alert_config)); } catch(e2) {}
-        window._ftApplyingRemote = false;
-        if (data.ft_escalas_custom) {
-          try { localStorage.setItem('ft_escalas_custom', JSON.stringify(data.ft_escalas_custom)); } catch(e2) {}
-        }
-        if (typeof window._ftRecarregarEscalas === 'function') window._ftRecarregarEscalas();
-        if (typeof window._ftAlertRender === 'function') window._ftAlertRender();
-        line('✅ Config do Firestore aplicada localmente!', '#26de81');
-        return;
-      }
-
-      if (!cfgLocal) {
-        line('⏭ Sem config local para forçar envio', '#8b97b0'); return;
-      }
-      line('⬆️ Enviando config local para o Firestore...', '#00c8f8');
-      var upd = { ft_alert_config: cfgLocal };
-      try {
-        var escLocal = JSON.parse(localStorage.getItem('ft_escalas_custom') || '{}');
-        if (Object.keys(escLocal).length > 0) upd['ft_escalas_custom'] = escLocal;
-      } catch(e2) {}
+      line('⬆️ Gravando dados mesclados no Firestore (todos os dispositivos vão receber)...', '#00c8f8');
       return db.collection(COL).doc(DOC).set(upd, { merge: true });
     })
-    .then(function(r) {
-      if (r === undefined) return;
-      line('✅ Firestore atualizado! Outros dispositivos receberão via onSnapshot.', '#26de81');
-      if (typeof window._ftAlertRender === 'function') window._ftAlertRender();
+    .then(function () {
+      line('✅ Firestore atualizado com sucesso!', '#26de81');
+
+      // ── Recarrega tudo em memória e re-renderiza a UI inteira, sem reload ──
+      if (typeof window._ftRecarregarEscalas === 'function') { try { window._ftRecarregarEscalas(); } catch (e) {} }
+      if (typeof window._ftAlertRender === 'function') { try { window._ftAlertRender(); } catch (e) {} }
+      if (typeof window._ftAplicarDadosRemotos === 'function') {
+        try { window._ftAplicarDadosRemotos(['ft_registros','ft_colaboradores','ft_postos','ft_bico_fixo','ft_horarios_custom']); } catch (e) {}
+      }
+      if (typeof window.onSyncComplete === 'function') { try { window.onSyncComplete(false); } catch (e) {} }
+      if (typeof window._ftCheckAndAlert === 'function') { try { window._ftCheckAndAlert(); } catch (e) {} }
+
+      line('🎉 Sincronização completa! Nenhum dado foi perdido — tudo foi mesclado.', '#26de81');
+      if (typeof window.showToast === 'function') window.showToast('☁️ Sincronização forçada concluída!', 'success');
     })
-    .catch(function(e) {
+    .catch(function (e) {
       line('❌ Erro: ' + e.message, '#fc5c65');
-      line('💡 Verifique as regras de segurança do Firestore', '#f7b731');
+      line('💡 Verifique sua conexão ou as regras de segurança do Firestore', '#f7b731');
     });
 };
+
 
 </script>
 
