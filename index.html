@@ -9332,11 +9332,59 @@ window.diagSync = function () {
     return resultado;
   }
 
-  // Mescla dois objetos chave→valor (ex.: ft_escalas_custom) por união de chaves
+  // Mescla dois objetos chave→valor simples (ex.: postosInativos, postosEscalaDia)
+  // por união de chaves. Adequado só para mapas de valores simples (boolean/string),
+  // NÃO para ft_escalas_custom — ver mergeEscalasCustom abaixo.
   function mergeMapas(local, remoto) {
     var out = {};
     if (local  && typeof local  === 'object') for (var k1 in local)  out[k1] = local[k1];
     if (remoto && typeof remoto === 'object') for (var k2 in remoto) out[k2] = remoto[k2]; // remoto prevalece em conflito
+    return out;
+  }
+
+  // Dois turnos são o mesmo turno se entrada, saída e período coincidem
+  function turnosIguais(a, b) {
+    return !!a && !!b && a.e === b.e && a.s === b.s && a.per === b.per;
+  }
+
+  // Mescla a semana (array de 7 dias, cada dia é uma lista de turnos) por
+  // UNIÃO de turnos dia a dia — nunca descarta um turno que só existe de
+  // um dos lados (ex.: turno de Dia de um dispositivo + turno de Noite do outro).
+  function mergeSemana(semanaLocal, semanaRemota) {
+    semanaLocal  = Array.isArray(semanaLocal)  ? semanaLocal  : [];
+    semanaRemota = Array.isArray(semanaRemota) ? semanaRemota : [];
+    var totalDias = Math.max(semanaLocal.length, semanaRemota.length, 7);
+    var resultado = [];
+    for (var i = 0; i < totalDias; i++) {
+      var turnosLocal  = Array.isArray(semanaLocal[i])  ? semanaLocal[i]  : [];
+      var turnosRemoto = Array.isArray(semanaRemota[i]) ? semanaRemota[i] : [];
+      var unidos = turnosLocal.slice();
+      turnosRemoto.forEach(function (t) {
+        var jaExiste = unidos.some(function (u) { return turnosIguais(u, t); });
+        if (!jaExiste) unidos.push(t);
+      });
+      resultado.push(unidos);
+    }
+    return resultado;
+  }
+
+  // Mescla ft_escalas_custom (mapa posto → { semana }) por UNIÃO de turnos
+  // dentro da semana de cada posto, em vez de o objeto inteiro de um posto
+  // sobrescrever o do outro lado. Isso corrige a perda de turnos (ex.:
+  // "Marangoni" ficar só com Noite porque o turno de Dia de um dos
+  // dispositivos era descartado ao mesclar por chave inteira).
+  function mergeEscalasCustom(local, remoto) {
+    local  = (local  && typeof local  === 'object') ? local  : {};
+    remoto = (remoto && typeof remoto === 'object') ? remoto : {};
+    var chaves = {};
+    Object.keys(local).forEach(function (k) { chaves[k] = true; });
+    Object.keys(remoto).forEach(function (k) { chaves[k] = true; });
+    var out = {};
+    Object.keys(chaves).forEach(function (posto) {
+      var semanaLocal  = local[posto]  && local[posto].semana;
+      var semanaRemota = remoto[posto] && remoto[posto].semana;
+      out[posto] = { semana: mergeSemana(semanaLocal, semanaRemota) };
+    });
     return out;
   }
 
@@ -9423,7 +9471,7 @@ window.diagSync = function () {
       // ── Mescla escalas customizadas ──
       var escLocal  = lerLocal(MAPA, true);
       var escRemoto = (data[MAPA] && typeof data[MAPA] === 'object') ? data[MAPA] : {};
-      var escMesclado = mergeMapas(escLocal, escRemoto);
+      var escMesclado = mergeEscalasCustom(escLocal, escRemoto);
       upd[MAPA] = escMesclado;
       gravarLocal(MAPA, escMesclado);
       line('🔀 ' + MAPA + ': ' + Object.keys(escMesclado).length + ' posto(s) com escala customizada', '#26de81');
