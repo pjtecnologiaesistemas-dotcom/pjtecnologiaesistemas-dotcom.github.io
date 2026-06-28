@@ -8646,16 +8646,35 @@ var FIRESTORE_DOC_ID     = 'dados';
     }
   }
 
-  // Carrega escalas customizadas do localStorage e injeta no ESCALAS_POSTOS ao iniciar
+  // Carrega escalas customizadas do localStorage e injeta no ESCALAS_POSTOS.
+  // IMPORTANTE: esta função é chamada repetidamente (toda vez que chega uma
+  // sincronização do Firestore, via _ftRecarregarEscalas) — por isso ela
+  // SÓ recarrega dados, sem nenhum efeito colateral de gravação. A migração
+  // de postos sem escala (que grava no Firestore) foi separada para
+  // migrarPostosSemEscalaUmaVez(), chamada uma única vez no init().
   function carregarEscalasCustomNaMemoria() {
     var custom = loadEscalasCustom();
     for (var posto in custom) {
       ESCALAS_POSTOS[posto] = { semana: custom[posto] };
     }
+  }
 
-    /* ── Migração: postos monitorados sem escala ganham escala padrão 24h ──
-       Garante que postos adicionados manualmente em versões anteriores
-       (antes da correção) também passem a gerar alertas. ────────────────── */
+  /* ── Migração: postos monitorados sem escala ganham escala padrão 24h ──
+     Garante que postos adicionados manualmente em versões anteriores
+     (antes da correção) também passem a gerar alertas.
+     ⚠️ Executa GRAVAÇÃO (salvarEscalaCustom) — por isso só pode rodar
+     UMA VEZ por carregamento real da página, nunca em resposta a um
+     snapshot remoto. Rodar isso a cada sincronização era exatamente o que
+     fazia uma edição de escala "voltar" para o padrão 18:00→06:00: um
+     snapshot do Firestore um pouco desatualizado chegava, a chamada
+     reativa de _ftRecarregarEscalas() rodava esta migração de novo, via
+     ESCALAS_POSTOS momentaneamente sem o posto, recriava a escala padrão
+     — e gravava esse padrão de volta no Firestore com um timestamp NOVO,
+     "confirmando" o valor errado como se fosse a edição mais recente. ── */
+  var _ftMigracaoEscalaJaExecutada = false;
+  function migrarPostosSemEscalaUmaVez() {
+    if (_ftMigracaoEscalaJaExecutada) return;
+    _ftMigracaoEscalaJaExecutada = true;
     var cfgMig = loadConfig();
     cfgMig.postos.forEach(function(posto) {
       var normP = norm(posto);
@@ -8794,6 +8813,7 @@ var FIRESTORE_DOC_ID     = 'dados';
   /* ── Inicialização ─────────────────────────────────────── */
   function init() {
     carregarEscalasCustomNaMemoria(); // injeta escalas salvas antes de tudo
+    migrarPostosSemEscalaUmaVez();    // roda só aqui, uma vez por carregamento da página
     // Garante config local SEM publicar no Firestore (evita sobrescrever config de outros dispositivos)
     (function() {
       try {
