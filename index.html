@@ -8611,6 +8611,18 @@ window._ftSalvarAlertConfigFirebase = function(cfg, ts) {
     return semana;
   }
 
+  // Salva escala APENAS localmente (localStorage + memória), sem enviar ao Firebase.
+  // Usada pela migração de postos sem escala, para evitar que a escala padrão
+  // 18:00–06:00 seja gravada no Firestore com timestamp novo, o que causaria
+  // sobrescrita da escala real do usuário no próximo onSnapshot.
+  function salvarEscalaCustomSomenteLocal(postoNome, semana) {
+    var custom = loadEscalasCustom();
+    custom[postoNome] = semana;
+    saveEscalasCustom(custom);
+    ESCALAS_POSTOS[postoNome] = { semana: semana };
+    // NÃO atualiza ft_escalas_custom_ts e NÃO chama _ftSalvarEscalaFirebase
+  }
+
   function salvarEscalaCustom(postoNome, semana) {
     var custom = loadEscalasCustom();
     custom[postoNome] = semana;
@@ -8827,13 +8839,19 @@ window._ftSalvarAlertConfigFirebase = function(cfg, ts) {
         }
       }
       if (!temEscala) {
+        // BUG CORRIGIDO: usa salvarEscalaCustomSomenteLocal() em vez de
+        // salvarEscalaCustom(), para NÃO gravar no Firebase.
+        // A versão anterior chamava salvarEscalaCustom() que envia ao Firebase
+        // com um timestamp novo — isso fazia o Firebase armazenar a escala
+        // padrão 18:00–06:00 com ts mais recente que a escala do usuário,
+        // causando sobrescrita na próxima carga pelo onSnapshot.
         var semanaDefault = [];
         for (var d = 0; d < 7; d++) {
           semanaDefault.push([
             { e: 18*60, s: 6*60, nd: true, per: 'noite' }
           ]);
         }
-        salvarEscalaCustom(posto, semanaDefault);
+        salvarEscalaCustomSomenteLocal(posto, semanaDefault);
       }
     });
   }
@@ -9051,7 +9069,9 @@ window._ftSalvarAlertConfigFirebase = function(cfg, ts) {
               { e: 18*60, s: 6*60, nd: true, per: 'noite' }
             ]);
           }
-          salvarEscalaCustom(val, semanaDefault);
+          // Usa SomenteLocal para não gravar escala padrão no Firebase,
+          // evitando que ela sobrescreva uma escala real via onSnapshot
+          salvarEscalaCustomSomenteLocal(val, semanaDefault);
         }
 
         renderConfigPostos();
@@ -9289,7 +9309,7 @@ window._ftSalvarAlertConfigFirebase = function(cfg, ts) {
             { e: 18*60, s: 6*60, nd: true, per: 'noite' }
           ]);
         }
-        salvarEscalaCustom(val, semanaDefault); // salva no localStorage E em ESCALAS_POSTOS
+        salvarEscalaCustomSomenteLocal(val, semanaDefault); // somente local, sem gravar no Firebase
       }
 
       renderBicoPostosMonitorados();
@@ -9463,7 +9483,7 @@ window._ftSalvarAlertConfigFirebase = function(cfg, ts) {
         for (var d = 0; d < 7; d++) {
           semanaDefault.push([{ e: 18*60, s: 6*60, nd: true, per: 'noite' }]);
         }
-        salvarEscalaCustom(val, semanaDefault);
+        salvarEscalaCustomSomenteLocal(val, semanaDefault);
       }
 
       if (inputPosto) inputPosto.value = '';
