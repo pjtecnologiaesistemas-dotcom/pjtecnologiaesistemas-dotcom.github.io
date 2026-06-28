@@ -7178,9 +7178,18 @@ var FIRESTORE_DOC_ID     = 'dados';
     if (window.SyncEngine) {
       SyncEngine.setRemote(function (entry) {
         // entry = { qid, op, store, payload, ts }
-        // Estratégia: sobrescreve o campo correspondente no documento único
-        var update = {};
-        update[entry.store] = entry.payload;
+        // Estratégia: sobrescreve o campo correspondente no documento único.
+        // Caso especial: store === '__escalas_payload__' significa que o payload
+        // já é um objeto com múltiplos campos (ft_escalas_custom + ft_escalas_custom_ts),
+        // gravados atomicamente para evitar que o onSnapshot receba o timestamp
+        // sem os dados correspondentes (ou vice-versa).
+        var update;
+        if (entry.store === '__escalas_payload__' && entry.payload && typeof entry.payload === 'object') {
+          update = entry.payload; // { ft_escalas_custom: {...}, ft_escalas_custom_ts: N }
+        } else {
+          update = {};
+          update[entry.store] = entry.payload;
+        }
 
         return db
           .collection(FIRESTORE_COLLECTION)
@@ -7283,15 +7292,22 @@ var FIRESTORE_DOC_ID     = 'dados';
         if (data['ft_escalas_custom'] !== undefined) {
           var remoteTsEsc = parseInt(data['ft_escalas_custom_ts'] || 0, 10) || 0;
           var localTsEsc  = parseInt(localStorage.getItem('ft_escalas_custom_ts') || '0', 10) || 0;
-          if (remoteTsEsc >= localTsEsc) {
+          // BUG FIX: era >= (maior-ou-igual). Com >=, quando o Firestore devolvia
+          // o snapshot com o mesmo timestamp que acabamos de gravar, a condição
+          // era verdadeira e sobrescrevia o localStorage com o dado que veio do
+          // servidor — que podia ainda ser o valor ANTIGO se a fila ainda não
+          // havia terminado de gravar ft_escalas_custom antes do ft_escalas_custom_ts.
+          // Com >, o dado local só é substituído quando o remoto for ESTRITAMENTE
+          // mais novo, ou seja, veio de outro dispositivo com edição posterior.
+          if (remoteTsEsc > localTsEsc) {
             try { localStorage.setItem('ft_escalas_custom', JSON.stringify(data['ft_escalas_custom'])); } catch (e) {}
             try { localStorage.setItem('ft_escalas_custom_ts', String(remoteTsEsc)); } catch (e) {}
             if (window.FT_Store) FT_Store.set('ft_escalas_custom', data['ft_escalas_custom']);
             chavesAtualizadas.push('ft_escalas_custom');
             escalasAtualizadas = true;
           }
-          // Se remoteTsEsc < localTsEsc: nossa edição local é mais nova que o
-          // que está no Firestore agora — ignora este snapshot. A própria
+          // Se remoteTsEsc <= localTsEsc: nossa edição local é mais nova (ou igual)
+          // que o que está no Firestore — ignora este snapshot. A própria
           // gravação pendente (FT_SyncQueue) vai corrigir o servidor em breve.
         }
 
@@ -8570,7 +8586,7 @@ var FIRESTORE_DOC_ID     = 'dados';
     var _ts = Date.now();
     try { localStorage.setItem('ft_escalas_custom_ts', String(_ts)); } catch(e) {}
     // ── Sincroniza com Firestore SOMENTE através da fila (FT_SyncQueue) ──
-    //    BUG CORRIGIDO: antes havia também uma gravação DIRETA aqui, em
+    //    BUG CORRIGIDO (anterior): antes havia também uma gravação DIRETA aqui, em
     //    paralelo com a fila, para "garantir" o envio mais rápido. Na
     //    prática isso criava uma condição de corrida — ao adicionar dois
     //    turnos em sequência rápida (ex.: dois dias diferentes, um atrás do
@@ -8580,11 +8596,18 @@ var FIRESTORE_DOC_ID     = 'dados';
     //    nos outros dispositivos (ou depois de limpar o app/recarregar sem
     //    cache local). A fila processa as gravações em ORDEM, uma de cada
     //    vez, o que elimina essa corrida.
+    //
+    //    BUG CORRIGIDO (novo — jun/2026): antes ft_escalas_custom e
+    //    ft_escalas_custom_ts eram enfileirados como dois enqueues separados.
+    //    O onSnapshot do Firestore pode disparar ENTRE os dois: primeiro chega
+    //    o _ts (novo) com os dados antigos ainda no documento, fazendo a
+    //    condição remoteTsEsc > localTsEsc ser falsa mas deixando o documento
+    //    num estado inconsistente. Agora ambos são gravados num único enqueue
+    //    atômico (um só .set com merge), garantindo que o timestamp e os dados
+    //    cheguem sempre juntos ao Firestore.
     if (window.FT_SyncQueue) {
-      FT_SyncQueue.enqueue('set', 'ft_escalas_custom', custom).then(function() {
-        if (window.SyncEngine) SyncEngine.flush();
-      });
-      FT_SyncQueue.enqueue('set', 'ft_escalas_custom_ts', _ts).then(function() {
+      // Payload único: dados + timestamp no mesmo .set
+      FT_SyncQueue.enqueue('set', '__escalas_payload__', { ft_escalas_custom: custom, ft_escalas_custom_ts: _ts }).then(function() {
         if (window.SyncEngine) SyncEngine.flush();
       });
     } else if (typeof window._ftAlertConfigSync === 'function') {
@@ -8688,10 +8711,8 @@ var FIRESTORE_DOC_ID     = 'dados';
         var _tsLimpar = Date.now();
         try { localStorage.setItem('ft_escalas_custom_ts', String(_tsLimpar)); } catch(e) {}
         if (window.FT_SyncQueue) {
-          FT_SyncQueue.enqueue('set', 'ft_escalas_custom', custom).then(function() {
-            if (window.SyncEngine) SyncEngine.flush();
-          });
-          FT_SyncQueue.enqueue('set', 'ft_escalas_custom_ts', _tsLimpar).then(function() {
+          // Payload atômico: dados + timestamp num único .set (mesmo padrão de salvarEscalaCustom)
+          FT_SyncQueue.enqueue('set', '__escalas_payload__', { ft_escalas_custom: custom, ft_escalas_custom_ts: _tsLimpar }).then(function() {
             if (window.SyncEngine) SyncEngine.flush();
           });
         }
