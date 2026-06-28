@@ -7137,6 +7137,18 @@ var FIREBASE_CONFIG = {
 var FIRESTORE_COLLECTION = 'folga_trabalhada';
 var FIRESTORE_DOC_ID     = 'dados';
 
+// Stubs — substituídos por implementações reais após Firebase conectar.
+// Evitam "window._ftSalvarEscalaFirebase is not a function" durante carregamento.
+window._ftSalvarEscalaFirebase = function(custom, ts) {
+  window._ftEscalaCustomPending   = custom;
+  window._ftEscalaCustomPendingTs = ts || Date.now();
+  console.log('[EscalaSync] Firebase ainda não conectado — dados pendentes em memória.');
+};
+window._ftSalvarAlertConfigFirebase = function(cfg, ts) {
+  window._ftAlertConfigPending = cfg;
+  console.log('[AlertConfigSync] Firebase ainda não conectado — config pendente em memória.');
+};
+
 // ─────────────────────────────────────────────────────────────
 
 (function () {
@@ -7178,17 +7190,15 @@ var FIRESTORE_DOC_ID     = 'dados';
     if (window.SyncEngine) {
       SyncEngine.setRemote(function (entry) {
         // entry = { qid, op, store, payload, ts }
-        // FIX: payloads atômicos (store com prefixo __) contêm múltiplos campos
-        // e são gravados diretamente com merge — evita corrida entre timestamp e dados.
+        // Stores com prefixo __ carregam payload multi-campo (atômico).
         var update;
-        if (entry.store === '__escalas_payload__' || entry.store === '__alert_config_payload__') {
-          // payload já é { campo1: valor1, campo2: valor2, ... }
-          update = (entry.payload && typeof entry.payload === 'object') ? entry.payload : {};
+        if (typeof entry.store === 'string' && entry.store.indexOf('__') === 0
+            && entry.payload && typeof entry.payload === 'object') {
+          update = entry.payload;
         } else {
           update = {};
           update[entry.store] = entry.payload;
         }
-
         return db
           .collection(FIRESTORE_COLLECTION)
           .doc(FIRESTORE_DOC_ID)
@@ -7196,7 +7206,7 @@ var FIRESTORE_DOC_ID     = 'dados';
           .then(function () { return true; })
           .catch(function (err) {
             console.warn('[FirebaseSync] Falha ao sincronizar:', err);
-            return false; // mantém na fila para tentar depois
+            return false;
           });
       });
 
@@ -7290,7 +7300,7 @@ var FIRESTORE_DOC_ID     = 'dados';
         if (data['ft_escalas_custom'] !== undefined) {
           var remoteTsEsc = parseInt(data['ft_escalas_custom_ts'] || 0, 10) || 0;
           var localTsEsc  = parseInt(localStorage.getItem('ft_escalas_custom_ts') || '0', 10) || 0;
-          if (remoteTsEsc > localTsEsc) {  // FIX: > em vez de >= evita sobrescrever edição local com snapshot do mesmo timestamp
+          if (remoteTsEsc > localTsEsc) {  // FIX: > evita snapshot sobrescrever edição local com mesmo ts
             try { localStorage.setItem('ft_escalas_custom', JSON.stringify(data['ft_escalas_custom'])); } catch (e) {}
             try { localStorage.setItem('ft_escalas_custom_ts', String(remoteTsEsc)); } catch (e) {}
             if (window.FT_Store) FT_Store.set('ft_escalas_custom', data['ft_escalas_custom']);
@@ -7306,22 +7316,24 @@ var FIRESTORE_DOC_ID     = 'dados';
         if (data['ft_alert_config'] !== undefined) {
           var remoteTsCfg = parseInt(data['ft_alert_config_ts'] || 0, 10) || 0;
           var localTsCfg  = parseInt(localStorage.getItem('ft_alert_config_ts') || '0', 10) || 0;
-          if (remoteTsCfg > localTsCfg) {  // FIX: > em vez de >= evita sobrescrever config local com snapshot do mesmo timestamp
-            var remotoCfg = data['ft_alert_config'];
-            var localRaw  = localStorage.getItem('ft_alert_config') || 'null';
-            var remotoRaw = JSON.stringify(remotoCfg);
-            var localCfg  = null;
-            try { localCfg = JSON.parse(localRaw); } catch(e) {}
-            var postosDifere = JSON.stringify((remotoCfg.postos||[]).slice().sort())
-                            !== JSON.stringify(((localCfg||{}).postos||[]).slice().sort());
-            var outroCampo  = JSON.stringify(remotoCfg) !== JSON.stringify(localCfg);
-            if (postosDifere || outroCampo) {
-              window._ftApplyingRemote = true;
-              try { localStorage.setItem('ft_alert_config', remotoRaw); } catch(e) {}
-              window._ftApplyingRemote = false;
-              alertCfgAtualizado = true;
-            }
-            try { localStorage.setItem('ft_alert_config_ts', String(remoteTsCfg)); } catch(e) {}
+          if (remoteTsCfg > localTsCfg) {  // FIX: > evita snapshot sobrescrever config local
+          var remotoCfg = data['ft_alert_config'];
+          // Sempre aplica: normaliza pela serialização para comparação estável
+          var localRaw  = localStorage.getItem('ft_alert_config') || 'null';
+          var remotoRaw = JSON.stringify(remotoCfg);
+          var localCfg  = null;
+          try { localCfg = JSON.parse(localRaw); } catch(e) {}
+          // Compara postos (principal campo que causa dessincronização)
+          var postosDifere = JSON.stringify((remotoCfg.postos||[]).slice().sort())
+                          !== JSON.stringify(((localCfg||{}).postos||[]).slice().sort());
+          var outroCampo  = JSON.stringify(remotoCfg) !== JSON.stringify(localCfg);
+          if (postosDifere || outroCampo) {
+            window._ftApplyingRemote = true;
+            try { localStorage.setItem('ft_alert_config', remotoRaw); } catch(e) {}
+            window._ftApplyingRemote = false;
+            alertCfgAtualizado = true;
+          }
+          try { localStorage.setItem('ft_alert_config_ts', String(remoteTsCfg)); } catch(e) {}
           }
         }
 
@@ -7382,6 +7394,41 @@ var FIRESTORE_DOC_ID     = 'dados';
 
     window._ftFirebaseConectado = true;
     console.log('[FirebaseSync] ✅ Conectado ao Firestore:', FIREBASE_CONFIG.projectId);
+
+    // ── Funções de gravação direta (bypassa a fila, garante persistência) ──
+    window._ftSalvarEscalaFirebase = function(custom, ts) {
+      try {
+        var col = window.FIRESTORE_COLLECTION || 'folga_trabalhada';
+        var did = window.FIRESTORE_DOC_ID     || 'dados';
+        db.collection(col).doc(did)
+          .set({ ft_escalas_custom: custom, ft_escalas_custom_ts: ts || Date.now() }, { merge: true })
+          .then(function() {
+            console.log('[EscalaSync] ✅ Escala salva no Firebase');
+            if (typeof window.showToast === 'function') window.showToast('☁️ Escala salva no Firebase!', 'success');
+          })
+          .catch(function(e) { console.warn('[EscalaSync] Erro:', e); });
+      } catch(e) { console.warn('[EscalaSync] Erro direto:', e); }
+    };
+
+    window._ftSalvarAlertConfigFirebase = function(cfg, ts) {
+      try {
+        var col = window.FIRESTORE_COLLECTION || 'folga_trabalhada';
+        var did = window.FIRESTORE_DOC_ID     || 'dados';
+        db.collection(col).doc(did)
+          .set({ ft_alert_config: cfg, ft_alert_config_ts: ts || Date.now() }, { merge: true })
+          .then(function() { console.log('[AlertConfigSync] ✅ Config salva no Firebase'); })
+          .catch(function(e) { console.warn('[AlertConfigSync] Erro:', e); });
+      } catch(e) { console.warn('[AlertConfigSync] Erro direto:', e); }
+    };
+
+    // Disponibiliza também como função global de sync forçado da escala atual
+    window._ftForceSyncEscala = function() {
+      try {
+        var custom = JSON.parse(localStorage.getItem('ft_escalas_custom') || '{}');
+        var ts     = parseInt(localStorage.getItem('ft_escalas_custom_ts') || '0') || Date.now();
+        window._ftSalvarEscalaFirebase(custom, ts);
+      } catch(e) {}
+    };
   }
 
   // ── Permite forçar uma (re)conexão real, usada pelo botão de Diagnóstico
@@ -7806,39 +7853,39 @@ var FIRESTORE_DOC_ID     = 'dados';
           <div style="font-size:.72rem;color:#8b97b0;">💡 Saída após meia-noite (ex: 18:00→06:00) é detectada automaticamente.</div>
         </div>
 
+        <!-- Botão de sync forçado -->
+        <button id="ft-escala-btn-sync" style="width:100%;border:none;border-radius:8px;background:linear-gradient(135deg,#26de81,#20a862);color:#0d1117;font-family:'Exo 2',sans-serif;font-size:.78rem;font-weight:700;padding:10px;cursor:pointer;margin-bottom:8px;display:flex;align-items:center;justify-content:center;gap:6px;">
+          ☁️ Salvar Escala no Firebase
+        </button>
+
         <button id="ft-escala-btn-limpar" style="width:100%;border:1.5px dashed rgba(252,92,101,.4);border-radius:8px;background:rgba(252,92,101,.07);color:#fc5c65;font-family:'Exo 2',sans-serif;font-size:.75rem;font-weight:700;padding:9px;cursor:pointer;margin-bottom:2px;">
           🗑️ Remover toda a escala deste posto
         </button>
       </div>
     </div>
 
-    <!-- Botões fechar -->
-    <div style="display:flex;gap:10px;margin-top:14px;">
-      <button id="ft-config-close" style="
-        flex:1;
-        border:1.5px solid #2a3347;
-        border-radius:12px;
-        background:transparent;
-        color:#8b97b0;
-        font-family:'Exo 2',sans-serif;
-        font-size:.88rem;
-        font-weight:700;
-        padding:13px;
-        cursor:pointer;
-      ">✕ Fechar</button>
-      <button id="ft-config-test" style="
-        flex:1;
-        border:none;
-        border-radius:12px;
-        background:rgba(247,183,49,.15);
-        border:1.5px solid rgba(247,183,49,.4);
-        color:#f7b731;
-        font-family:'Exo 2',sans-serif;
-        font-size:.88rem;
-        font-weight:700;
-        padding:13px;
-        cursor:pointer;
-      ">🔔 Testar Alerta Agora</button>
+    <!-- Botões inferiores -->
+    <div style="display:flex;flex-direction:column;gap:8px;margin-top:14px;">
+      <!-- Sync forçado geral (config + escalas) -->
+      <button id="ft-config-force-sync" style="
+        width:100%;border:none;border-radius:12px;
+        background:linear-gradient(135deg,#45aaf2,#1a6fc4);
+        color:#fff;font-family:'Exo 2',sans-serif;font-size:.88rem;font-weight:700;
+        padding:13px;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px;
+      ">☁️ Forçar Sincronização com Firebase</button>
+      <div style="display:flex;gap:10px;">
+        <button id="ft-config-close" style="
+          flex:1;border:1.5px solid #2a3347;border-radius:12px;
+          background:transparent;color:#8b97b0;font-family:'Exo 2',sans-serif;
+          font-size:.88rem;font-weight:700;padding:13px;cursor:pointer;
+        ">✕ Fechar</button>
+        <button id="ft-config-test" style="
+          flex:1;border:none;border-radius:12px;
+          background:rgba(247,183,49,.15);border:1.5px solid rgba(247,183,49,.4);
+          color:#f7b731;font-family:'Exo 2',sans-serif;font-size:.88rem;
+          font-weight:700;padding:13px;cursor:pointer;
+        ">🔔 Testar Alerta Agora</button>
+      </div>
     </div>
   </div>
 </div>
@@ -7994,17 +8041,19 @@ var FIRESTORE_DOC_ID     = 'dados';
       //    podia sobrescrever no servidor um turno recém-adicionado em
       //    outra ação, com um valor de escala mais antigo. A fila grava em
       //    ordem, um item por vez — elimina essa corrida.
+      // ── Grava direto no Firestore (caminho principal) ──────────────
+      window._ftSalvarAlertConfigFirebase(cfg, _tsCfg);
+
+      // ── Enfileira também (fallback/offline) ──────────────────────
       if (window.FT_SyncQueue) {
-        // FIX: payload atômico — config + timestamp num único .set para evitar
-        // que o onSnapshot receba o _ts novo com a config antiga ainda no Firestore
-        FT_SyncQueue.enqueue('set', '__alert_config_payload__', { ft_alert_config: cfg, ft_alert_config_ts: _tsCfg }).then(function() {
+        FT_SyncQueue.enqueue('set', '__alert_config_payload__',
+          { ft_alert_config: cfg, ft_alert_config_ts: _tsCfg }
+        ).then(function() {
           if (window.SyncEngine) SyncEngine.flush();
         });
       } else if (typeof window._ftAlertConfigSync === 'function') {
-        // Fallback: só usado se a fila IndexedDB estiver indisponível neste navegador
         try { window._ftAlertConfigSync(cfg); } catch (e) {}
       } else {
-        // Nem fila nem Firebase disponíveis ainda — guarda para enviar assim que conectar
         window._ftAlertConfigPending = cfg;
       }
     }
@@ -8584,28 +8633,22 @@ var FIRESTORE_DOC_ID     = 'dados';
     //    nos outros dispositivos (ou depois de limpar o app/recarregar sem
     //    cache local). A fila processa as gravações em ORDEM, uma de cada
     //    vez, o que elimina essa corrida.
+    // ── Grava direto no Firestore (caminho principal) ──────────────
+    // Não depende da fila IndexedDB que pode estar atrasada/bloqueada.
+    // É a única gravação que realmente persiste entre sessões/dispositivos.
+    window._ftSalvarEscalaFirebase(custom, _ts);
+
+    // ── Enfileira também na fila (fallback/offline) ──────────────────
     if (window.FT_SyncQueue) {
-      // FIX: payload atômico — dados + timestamp num único .set para evitar
-      // que o onSnapshot receba o _ts novo com os dados antigos ainda no Firestore
-      FT_SyncQueue.enqueue('set', '__escalas_payload__', { ft_escalas_custom: custom, ft_escalas_custom_ts: _ts }).then(function() {
+      FT_SyncQueue.enqueue('set', '__escalas_payload__',
+        { ft_escalas_custom: custom, ft_escalas_custom_ts: _ts }
+      ).then(function() {
         if (window.SyncEngine) SyncEngine.flush();
       });
-    } else if (typeof window._ftAlertConfigSync === 'function') {
-      // Fallback: só usado se a fila IndexedDB estiver indisponível neste navegador
-      try {
-        var upd = { ft_escalas_custom: custom, ft_escalas_custom_ts: _ts };
-        var col = window.FIRESTORE_COLLECTION || 'folga_trabalhada';
-        var did = window.FIRESTORE_DOC_ID     || 'dados';
-        if (typeof firebase !== 'undefined') {
-          firebase.firestore().collection(col).doc(did)
-            .set(upd, { merge: true })
-            .catch(function(e){ console.warn('[EscalaSync]', e); });
-        }
-      } catch(e) {}
-    } else {
-      // Nem fila nem Firebase disponíveis ainda — guarda para envio posterior
-      window._ftEscalaCustomPending = custom;
-      window._ftEscalaCustomPendingTs = _ts;
+    }
+    if (!window.FT_SyncQueue && !window._ftFirebaseConectado) {
+      window._ftEscalaCustomPending    = custom;
+      window._ftEscalaCustomPendingTs  = _ts;
     }
   }
 
@@ -8653,20 +8696,14 @@ var FIRESTORE_DOC_ID     = 'dados';
     if (typeof window.showToast === 'function') window.showToast('🗑️ Turno removido.', 'error');
   }
 
-  // Expõe função de recarga de escalas para o onSnapshot poder chamar após sync remoto
+  // Exposta para o onSnapshot chamar quando recebe escalas de outro dispositivo
   window._ftRecarregarEscalas = function() {
-    try { renderEscalaSelectPostos(); } catch(e) {}
-    // Se há um posto sendo editado, re-renderiza sua lista de dias
-    if (_escalaPosToEdit) {
-      try { renderEscalaDiasList(_escalaPosToEdit); } catch(e) {}
-    }
-    // Recarrega ESCALAS_POSTOS em memória com os dados mais recentes do localStorage
     try {
       var custom = JSON.parse(localStorage.getItem('ft_escalas_custom') || '{}');
-      for (var k in custom) {
-        ESCALAS_POSTOS[k] = { semana: custom[k] };
-      }
+      for (var k in custom) { ESCALAS_POSTOS[k] = { semana: custom[k] }; }
     } catch(e) {}
+    try { renderEscalaSelectPostos(); } catch(e) {}
+    if (_escalaPosToEdit) { try { renderEscalaDiasList(_escalaPosToEdit); } catch(e) {} }
   };
 
   function initEscalaEditor() {
@@ -8692,6 +8729,30 @@ var FIRESTORE_DOC_ID     = 'dados';
       });
     }
 
+    var btnSync = document.getElementById('ft-escala-btn-sync');
+    if (btnSync) {
+      btnSync.addEventListener('click', function() {
+        if (!_escalaPosToEdit) {
+          if (typeof window.showToast === 'function') window.showToast('⚠️ Nenhum posto selecionado.', 'error');
+          return;
+        }
+        var custom = loadEscalasCustom();
+        var _ts    = Date.now();
+        try { localStorage.setItem('ft_escalas_custom_ts', String(_ts)); } catch(e) {}
+        if (typeof window._ftSalvarEscalaFirebase === 'function') {
+          btnSync.textContent = '⏳ Salvando…';
+          btnSync.disabled = true;
+          window._ftSalvarEscalaFirebase(custom, _ts);
+          setTimeout(function() {
+            btnSync.innerHTML = '☁️ Salvar Escala no Firebase';
+            btnSync.disabled  = false;
+          }, 2000);
+        } else {
+          if (typeof window.showToast === 'function') window.showToast('⚠️ Firebase ainda não conectado.', 'error');
+        }
+      });
+    }
+
     var btnLimpar = document.getElementById('ft-escala-btn-limpar');
     if (btnLimpar) {
       btnLimpar.addEventListener('click', function() {
@@ -8706,9 +8767,11 @@ var FIRESTORE_DOC_ID     = 'dados';
         // em salvarEscalaCustom — sem isso a remoção ficava só neste aparelho).
         var _tsLimpar = Date.now();
         try { localStorage.setItem('ft_escalas_custom_ts', String(_tsLimpar)); } catch(e) {}
+        window._ftSalvarEscalaFirebase(custom, _tsLimpar);
         if (window.FT_SyncQueue) {
-          // FIX: payload atômico — dados + timestamp num único .set
-          FT_SyncQueue.enqueue('set', '__escalas_payload__', { ft_escalas_custom: custom, ft_escalas_custom_ts: _tsLimpar }).then(function() {
+          FT_SyncQueue.enqueue('set', '__escalas_payload__',
+            { ft_escalas_custom: custom, ft_escalas_custom_ts: _tsLimpar }
+          ).then(function() {
             if (window.SyncEngine) SyncEngine.flush();
           });
         }
@@ -8915,6 +8978,27 @@ var FIRESTORE_DOC_ID     = 'dados';
     });
 
     bind('ft-alert-config-btn', function () { hideAlertModal(); openConfigModal(); });
+
+    bind('ft-config-force-sync', function () {
+      var btn = document.getElementById('ft-config-force-sync');
+      if (btn) { btn.textContent = '⏳ Sincronizando…'; btn.disabled = true; }
+      // Sincroniza escalas
+      if (typeof window._ftForceSyncEscala === 'function') window._ftForceSyncEscala();
+      // Sincroniza config de alertas
+      try {
+        var cfg = loadConfig();
+        if (cfg && typeof window._ftSalvarAlertConfigFirebase === 'function') {
+          var ts = parseInt(localStorage.getItem('ft_alert_config_ts') || '0') || Date.now();
+          window._ftSalvarAlertConfigFirebase(cfg, ts);
+        }
+      } catch(e) {}
+      // Drena fila
+      if (window.SyncEngine) SyncEngine.flush();
+      setTimeout(function() {
+        if (btn) { btn.innerHTML = '☁️ Forçar Sincronização com Firebase'; btn.disabled = false; }
+        if (typeof window.showToast === 'function') window.showToast('☁️ Sincronização forçada enviada!', 'success');
+      }, 2500);
+    });
 
     bind('ft-config-close', function () {
       document.getElementById('ft-config-overlay').style.display = 'none';
