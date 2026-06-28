@@ -7176,10 +7176,19 @@ var FIRESTORE_DOC_ID     = 'dados';
     // ── Bridge de escrita: saveConfig chama esta função após Firebase conectar ──
     window._ftAlertConfigSync = function (cfg) {
       var upd = { ft_alert_config: cfg };
+      // Inclui o timestamp da edição (salvo em localStorage por saveConfig)
+      // para que o listener onSnapshot, em qualquer dispositivo, saiba se
+      // este dado é mais novo que o que ele já tem antes de aplicá-lo.
+      try {
+        var tsCfg = parseInt(localStorage.getItem('ft_alert_config_ts') || '0', 10);
+        if (tsCfg) upd['ft_alert_config_ts'] = tsCfg;
+      } catch(e) {}
       // Grava ft_escalas_custom junto para manter consistência entre dispositivos
       try {
         var esc = JSON.parse(localStorage.getItem('ft_escalas_custom') || '{}');
         if (Object.keys(esc).length > 0) upd['ft_escalas_custom'] = esc;
+        var tsEsc = parseInt(localStorage.getItem('ft_escalas_custom_ts') || '0', 10);
+        if (tsEsc) upd['ft_escalas_custom_ts'] = tsEsc;
       } catch(e) {}
       db.collection(FIRESTORE_COLLECTION)
         .doc(FIRESTORE_DOC_ID)
@@ -7198,12 +7207,16 @@ var FIRESTORE_DOC_ID     = 'dados';
       try {
         var col = FIRESTORE_COLLECTION || 'folga_trabalhada';
         var did = FIRESTORE_DOC_ID     || 'dados';
+        var updEsc = { ft_escalas_custom: window._ftEscalaCustomPending };
+        if (window._ftEscalaCustomPendingTs) updEsc['ft_escalas_custom_ts'] = window._ftEscalaCustomPendingTs;
         db.collection(col).doc(did)
-          .set({ ft_escalas_custom: window._ftEscalaCustomPending }, { merge: true })
+          .set(updEsc, { merge: true })
           .catch(function(e){ console.warn('[EscalaSync pending]', e); });
         window._ftEscalaCustomPending = null;
+        window._ftEscalaCustomPendingTs = null;
       } catch(e) {}
     }
+
 
     // ── Listener em tempo real (recebe mudanças de outros dispositivos) ──
     db.collection(FIRESTORE_COLLECTION)
@@ -7218,31 +7231,41 @@ var FIRESTORE_DOC_ID     = 'dados';
         var alertCfgAtualizado  = false;
 
         ['ft_registros', 'ft_colaboradores', 'ft_postos', 'ft_bico_fixo',
-         'ft_horarios_custom', 'ft_escalas_custom'].forEach(function (key) {
+         'ft_horarios_custom'].forEach(function (key) {
           if (data[key] !== undefined) {
-            // ── Trava anti-sobrescrita: se este dispositivo acabou de salvar
-            //    esta chave localmente há poucos segundos, ignora o snapshot
-            //    remoto (pode ainda ser a versão antiga, anterior à nossa
-            //    gravação, que ainda não propagou no Firestore). Sem isto,
-            //    editar e recarregar a página rápido demais fazia a edição
-            //    "voltar" para o valor anterior.
-            var guardUntil = (window._ftLocalSaveGuard || {})[key] || 0;
-            if (Date.now() < guardUntil) return;
-
             try { localStorage.setItem(key, JSON.stringify(data[key])); } catch (e) {}
             if (window.FT_Store) FT_Store.set(key, data[key]);
             chavesAtualizadas.push(key);
-            if (key === 'ft_escalas_custom') escalasAtualizadas = true;
           }
         });
 
-        // Sincroniza ft_alert_config
+        // ── ft_escalas_custom: aplica o valor remoto SOMENTE se o timestamp
+        //    de gravação remoto não for mais antigo que a última edição feita
+        //    neste dispositivo. O timestamp fica salvo em localStorage (não
+        //    em memória), então sobrevive a um reload da página — é isso que
+        //    impede que uma edição feita pouco antes de recarregar a página
+        //    seja revertida por um snapshot do Firestore que ainda não tinha
+        //    recebido a gravação no momento em que a página recarregou.
+        if (data['ft_escalas_custom'] !== undefined) {
+          var remoteTsEsc = parseInt(data['ft_escalas_custom_ts'] || 0, 10) || 0;
+          var localTsEsc  = parseInt(localStorage.getItem('ft_escalas_custom_ts') || '0', 10) || 0;
+          if (remoteTsEsc >= localTsEsc) {
+            try { localStorage.setItem('ft_escalas_custom', JSON.stringify(data['ft_escalas_custom'])); } catch (e) {}
+            try { localStorage.setItem('ft_escalas_custom_ts', String(remoteTsEsc)); } catch (e) {}
+            if (window.FT_Store) FT_Store.set('ft_escalas_custom', data['ft_escalas_custom']);
+            chavesAtualizadas.push('ft_escalas_custom');
+            escalasAtualizadas = true;
+          }
+          // Se remoteTsEsc < localTsEsc: nossa edição local é mais nova que o
+          // que está no Firestore agora — ignora este snapshot. A própria
+          // gravação pendente (FT_SyncQueue) vai corrigir o servidor em breve.
+        }
+
+        // Sincroniza ft_alert_config (mesma lógica de timestamp acima)
         if (data['ft_alert_config'] !== undefined) {
-          var guardUntilCfg = (window._ftLocalSaveGuard || {})['ft_alert_config'] || 0;
-          if (Date.now() < guardUntilCfg) {
-            // Edição local recente — ignora este snapshot remoto para não
-            // sobrescrever a alteração que o usuário acabou de fazer.
-          } else {
+          var remoteTsCfg = parseInt(data['ft_alert_config_ts'] || 0, 10) || 0;
+          var localTsCfg  = parseInt(localStorage.getItem('ft_alert_config_ts') || '0', 10) || 0;
+          if (remoteTsCfg >= localTsCfg) {
           var remotoCfg = data['ft_alert_config'];
           // Sempre aplica: normaliza pela serialização para comparação estável
           var localRaw  = localStorage.getItem('ft_alert_config') || 'null';
@@ -7259,6 +7282,7 @@ var FIRESTORE_DOC_ID     = 'dados';
             window._ftApplyingRemote = false;
             alertCfgAtualizado = true;
           }
+          try { localStorage.setItem('ft_alert_config_ts', String(remoteTsCfg)); } catch(e) {}
           }
         }
 
@@ -7917,11 +7941,10 @@ var FIRESTORE_DOC_ID     = 'dados';
     try { localStorage.setItem(LS_CONFIG, JSON.stringify(cfg)); } catch (e) {}
     // Envia ao Firestore apenas quando mudança veio do usuário (não de snapshot remoto)
     if (!window._ftApplyingRemote) {
-      // ── Trava anti-sobrescrita: protege esta edição local (ex.: escala
-      //    par/ímpar, turno dia/noite ativo) contra um snapshot remoto
-      //    desatualizado revertê-la ao recarregar a página.
-      if (!window._ftLocalSaveGuard) window._ftLocalSaveGuard = {};
-      window._ftLocalSaveGuard['ft_alert_config'] = Date.now() + 10000;
+      // ── Timestamp da edição: salvo em localStorage (sobrevive a reload).
+      //    É comparado pelo listener onSnapshot para decidir se um dado
+      //    remoto pode sobrescrever esta edição local ou não.
+      try { localStorage.setItem('ft_alert_config_ts', String(Date.now())); } catch (e) {}
       if (typeof window._ftAlertConfigSync === 'function') {
         try { window._ftAlertConfigSync(cfg); } catch (e) {}
       } else {
@@ -7936,6 +7959,9 @@ var FIRESTORE_DOC_ID     = 'dados';
       // salva sem conexão.
       if (window.FT_SyncQueue) {
         FT_SyncQueue.enqueue('set', LS_CONFIG, cfg).then(function() {
+          if (window.SyncEngine) SyncEngine.flush();
+        });
+        FT_SyncQueue.enqueue('set', 'ft_alert_config_ts', parseInt(localStorage.getItem('ft_alert_config_ts')||'0',10)).then(function() {
           if (window.SyncEngine) SyncEngine.flush();
         });
       }
@@ -8500,16 +8526,16 @@ var FIRESTORE_DOC_ID     = 'dados';
     saveEscalasCustom(custom);
     // Atualiza ESCALAS_POSTOS em memória
     ESCALAS_POSTOS[postoNome] = { semana: semana };
-    // ── Trava anti-sobrescrita: protege esta edição local contra um
-    //    snapshot remoto desatualizado chegar (ex.: ao recarregar a
-    //    página) e revertê-la antes da nossa gravação propagar.
-    if (!window._ftLocalSaveGuard) window._ftLocalSaveGuard = {};
-    window._ftLocalSaveGuard['ft_escalas_custom'] = Date.now() + 10000;
+    // ── Timestamp da edição: salvo em localStorage (sobrevive a reload).
+    //    É comparado pelo listener onSnapshot para decidir se um dado
+    //    remoto pode sobrescrever esta edição local ou não.
+    var _ts = Date.now();
+    try { localStorage.setItem('ft_escalas_custom_ts', String(_ts)); } catch(e) {}
     // Sincroniza ft_escalas_custom com Firestore para outros dispositivos
     if (typeof window._ftAlertConfigSync === 'function') {
       // Reutiliza a bridge para gravar ft_escalas_custom junto
       try {
-        var upd = { ft_escalas_custom: custom };
+        var upd = { ft_escalas_custom: custom, ft_escalas_custom_ts: _ts };
         var col = window.FIRESTORE_COLLECTION || 'folga_trabalhada';
         var did = window.FIRESTORE_DOC_ID     || 'dados';
         if (typeof firebase !== 'undefined') {
@@ -8521,12 +8547,16 @@ var FIRESTORE_DOC_ID     = 'dados';
     } else {
       // Firebase ainda não conectou — enfileira para envio posterior
       window._ftEscalaCustomPending = loadEscalasCustom();
+      window._ftEscalaCustomPendingTs = _ts;
     }
     // Reforço de durabilidade (mesma fila do IndexedDB usada para os demais
     // dados): garante reenvio automático mesmo se a aba fechar offline antes
     // do envio direto acima ser concluído.
     if (window.FT_SyncQueue) {
       FT_SyncQueue.enqueue('set', 'ft_escalas_custom', custom).then(function() {
+        if (window.SyncEngine) SyncEngine.flush();
+      });
+      FT_SyncQueue.enqueue('set', 'ft_escalas_custom_ts', _ts).then(function() {
         if (window.SyncEngine) SyncEngine.flush();
       });
     }
