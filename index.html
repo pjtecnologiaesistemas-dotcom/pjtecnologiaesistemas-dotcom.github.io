@@ -7853,10 +7853,53 @@ window._ftSalvarAlertConfigFirebase = function(cfg, ts) {
           <div style="font-size:.72rem;color:#8b97b0;">💡 Saída após meia-noite (ex: 18:00→06:00) é detectada automaticamente.</div>
         </div>
 
-        <!-- Botão de sync forçado -->
-        <button id="ft-escala-btn-sync" style="width:100%;border:none;border-radius:8px;background:linear-gradient(135deg,#26de81,#20a862);color:#0d1117;font-family:'Exo 2',sans-serif;font-size:.78rem;font-weight:700;padding:10px;cursor:pointer;margin-bottom:8px;display:flex;align-items:center;justify-content:center;gap:6px;">
-          ☁️ Salvar Escala no Firebase
-        </button>
+        <!-- ══ BOTÃO MASTER DE PUBLICAÇÃO ══ -->
+        <div style="position:relative;margin-bottom:10px;">
+          <!-- Anel de brilho pulsante atrás do botão -->
+          <div id="ft-escala-sync-glow" style="
+            position:absolute;inset:-4px;border-radius:16px;
+            background:linear-gradient(135deg,#f7b731,#fd9644,#fc5c65,#f7b731);
+            background-size:300% 300%;
+            animation:masterGlow 2.5s ease infinite;
+            opacity:.55;filter:blur(8px);z-index:0;
+          "></div>
+          <button id="ft-escala-btn-sync" style="
+            position:relative;z-index:1;
+            width:100%;border:none;border-radius:12px;
+            background:linear-gradient(135deg,#f7b731 0%,#fd9644 50%,#fc5c65 100%);
+            background-size:200% 200%;
+            color:#0d1117;font-family:'Exo 2',sans-serif;
+            font-size:.95rem;font-weight:900;letter-spacing:1.2px;text-transform:uppercase;
+            padding:16px 10px;cursor:pointer;
+            display:flex;align-items:center;justify-content:center;gap:10px;
+            box-shadow:0 6px 28px rgba(247,183,49,.55),0 2px 8px rgba(0,0,0,.4);
+            transition:transform .15s,box-shadow .2s;
+            animation:masterPulse 2.5s ease infinite;
+          "
+          onmouseenter="this.style.transform='scale(1.03)';this.style.boxShadow='0 10px 40px rgba(247,183,49,.75),0 2px 8px rgba(0,0,0,.4)'"
+          onmouseleave="this.style.transform='scale(1)';this.style.boxShadow='0 6px 28px rgba(247,183,49,.55),0 2px 8px rgba(0,0,0,.4)'"
+          onmousedown="this.style.transform='scale(.97)'"
+          onmouseup="this.style.transform='scale(1.03)'">
+            <span style="font-size:1.15rem;">⚡</span>
+            <span id="ft-escala-sync-label">PUBLICAR ESCALA EM TODOS OS DISPOSITIVOS</span>
+            <span style="font-size:1.15rem;">☁️</span>
+          </button>
+        </div>
+
+        <style>
+          @keyframes masterGlow {
+            0%,100% { background-position:0% 50%; opacity:.45; }
+            50%      { background-position:100% 50%; opacity:.75; }
+          }
+          @keyframes masterPulse {
+            0%,100% { background-position:0% 50%; }
+            50%      { background-position:100% 50%; }
+          }
+          #ft-escala-btn-sync:disabled {
+            opacity:.7;cursor:default;animation:none;
+          }
+          #ft-escala-btn-sync:disabled + * { opacity:.4; }
+        </style>
 
         <button id="ft-escala-btn-limpar" style="width:100%;border:1.5px dashed rgba(252,92,101,.4);border-radius:8px;background:rgba(252,92,101,.07);color:#fc5c65;font-family:'Exo 2',sans-serif;font-size:.75rem;font-weight:700;padding:9px;cursor:pointer;margin-bottom:2px;">
           🗑️ Remover toda a escala deste posto
@@ -8742,6 +8785,7 @@ window._ftSalvarAlertConfigFirebase = function(cfg, ts) {
     }
 
     var btnSync = document.getElementById('ft-escala-btn-sync');
+    var btnSyncGlow = document.getElementById('ft-escala-sync-glow');
     if (btnSync) {
       btnSync.addEventListener('click', function() {
         if (!_escalaPosToEdit) {
@@ -8752,13 +8796,30 @@ window._ftSalvarAlertConfigFirebase = function(cfg, ts) {
         var _ts    = Date.now();
         try { localStorage.setItem('ft_escalas_custom_ts', String(_ts)); } catch(e) {}
         if (typeof window._ftSalvarEscalaFirebase === 'function') {
-          btnSync.textContent = '⏳ Salvando…';
+          // Estado: enviando
+          var label = document.getElementById('ft-escala-sync-label');
           btnSync.disabled = true;
+          if (btnSyncGlow) btnSyncGlow.style.background = 'linear-gradient(135deg,#45aaf2,#26de81,#45aaf2)';
+          if (label) label.textContent = 'ENVIANDO PARA O FIREBASE…';
+          btnSync.style.background = 'linear-gradient(135deg,#45aaf2 0%,#26de81 100%)';
+          btnSync.style.boxShadow  = '0 6px 28px rgba(69,170,242,.55),0 2px 8px rgba(0,0,0,.4)';
+
           window._ftSalvarEscalaFirebase(custom, _ts);
+
           setTimeout(function() {
-            btnSync.innerHTML = '☁️ Salvar Escala no Firebase';
-            btnSync.disabled  = false;
-          }, 2000);
+            // Estado: sucesso
+            if (label) label.textContent = '✅ ESCALA PUBLICADA COM SUCESSO!';
+            btnSync.style.background = 'linear-gradient(135deg,#26de81 0%,#20a862 100%)';
+            if (btnSyncGlow) btnSyncGlow.style.background = 'linear-gradient(135deg,#26de81,#45aaf2,#26de81)';
+            setTimeout(function() {
+              // Volta ao estado normal
+              btnSync.disabled = false;
+              if (label) label.textContent = 'PUBLICAR ESCALA EM TODOS OS DISPOSITIVOS';
+              btnSync.style.background = 'linear-gradient(135deg,#f7b731 0%,#fd9644 50%,#fc5c65 100%)';
+              btnSync.style.boxShadow  = '0 6px 28px rgba(247,183,49,.55),0 2px 8px rgba(0,0,0,.4)';
+              if (btnSyncGlow) btnSyncGlow.style.background = 'linear-gradient(135deg,#f7b731,#fd9644,#fc5c65,#f7b731)';
+            }, 2000);
+          }, 1800);
         } else {
           if (typeof window.showToast === 'function') window.showToast('⚠️ Firebase ainda não conectado.', 'error');
         }
