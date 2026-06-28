@@ -8531,9 +8531,26 @@ var FIRESTORE_DOC_ID     = 'dados';
     //    remoto pode sobrescrever esta edição local ou não.
     var _ts = Date.now();
     try { localStorage.setItem('ft_escalas_custom_ts', String(_ts)); } catch(e) {}
-    // Sincroniza ft_escalas_custom com Firestore para outros dispositivos
-    if (typeof window._ftAlertConfigSync === 'function') {
-      // Reutiliza a bridge para gravar ft_escalas_custom junto
+    // ── Sincroniza com Firestore SOMENTE através da fila (FT_SyncQueue) ──
+    //    BUG CORRIGIDO: antes havia também uma gravação DIRETA aqui, em
+    //    paralelo com a fila, para "garantir" o envio mais rápido. Na
+    //    prática isso criava uma condição de corrida — ao adicionar dois
+    //    turnos em sequência rápida (ex.: dois dias diferentes, um atrás do
+    //    outro), a gravação direta do 1º turno podia terminar DEPOIS da
+    //    gravação do 2º (direta ou pela fila), e o valor mais antigo
+    //    "vencia" no Firestore, fazendo o turno recém-adicionado desaparecer
+    //    nos outros dispositivos (ou depois de limpar o app/recarregar sem
+    //    cache local). A fila processa as gravações em ORDEM, uma de cada
+    //    vez, o que elimina essa corrida.
+    if (window.FT_SyncQueue) {
+      FT_SyncQueue.enqueue('set', 'ft_escalas_custom', custom).then(function() {
+        if (window.SyncEngine) SyncEngine.flush();
+      });
+      FT_SyncQueue.enqueue('set', 'ft_escalas_custom_ts', _ts).then(function() {
+        if (window.SyncEngine) SyncEngine.flush();
+      });
+    } else if (typeof window._ftAlertConfigSync === 'function') {
+      // Fallback: só usado se a fila IndexedDB estiver indisponível neste navegador
       try {
         var upd = { ft_escalas_custom: custom, ft_escalas_custom_ts: _ts };
         var col = window.FIRESTORE_COLLECTION || 'folga_trabalhada';
@@ -8545,20 +8562,9 @@ var FIRESTORE_DOC_ID     = 'dados';
         }
       } catch(e) {}
     } else {
-      // Firebase ainda não conectou — enfileira para envio posterior
-      window._ftEscalaCustomPending = loadEscalasCustom();
+      // Nem fila nem Firebase disponíveis ainda — guarda para envio posterior
+      window._ftEscalaCustomPending = custom;
       window._ftEscalaCustomPendingTs = _ts;
-    }
-    // Reforço de durabilidade (mesma fila do IndexedDB usada para os demais
-    // dados): garante reenvio automático mesmo se a aba fechar offline antes
-    // do envio direto acima ser concluído.
-    if (window.FT_SyncQueue) {
-      FT_SyncQueue.enqueue('set', 'ft_escalas_custom', custom).then(function() {
-        if (window.SyncEngine) SyncEngine.flush();
-      });
-      FT_SyncQueue.enqueue('set', 'ft_escalas_custom_ts', _ts).then(function() {
-        if (window.SyncEngine) SyncEngine.flush();
-      });
     }
   }
 
@@ -8639,6 +8645,18 @@ var FIRESTORE_DOC_ID     = 'dados';
         // Remove do ESCALAS_POSTOS em memória também
         delete ESCALAS_POSTOS[_escalaPosToEdit];
         saveEscalasCustom(custom);
+        // Sincroniza a remoção com os outros dispositivos (mesma fila usada
+        // em salvarEscalaCustom — sem isso a remoção ficava só neste aparelho).
+        var _tsLimpar = Date.now();
+        try { localStorage.setItem('ft_escalas_custom_ts', String(_tsLimpar)); } catch(e) {}
+        if (window.FT_SyncQueue) {
+          FT_SyncQueue.enqueue('set', 'ft_escalas_custom', custom).then(function() {
+            if (window.SyncEngine) SyncEngine.flush();
+          });
+          FT_SyncQueue.enqueue('set', 'ft_escalas_custom_ts', _tsLimpar).then(function() {
+            if (window.SyncEngine) SyncEngine.flush();
+          });
+        }
         renderEscalaDiasList(_escalaPosToEdit);
         updateHeaderBadge();
         if (typeof window.showToast === 'function') window.showToast('🗑️ Escala removida.', 'success');
