@@ -7173,7 +7173,9 @@ var FIRESTORE_DOC_ID     = 'dados';
       SyncEngine.flush();
     }
 
-    // ── Bridge de escrita: saveConfig chama esta função após Firebase conectar ──
+    // ── Bridge de escrita: usada como FALLBACK (quando a fila IndexedDB não
+    //    está disponível) e para reenviar o que ficou pendente de antes do
+    //    Firebase conectar. Não é mais o caminho principal — ver saveConfig().
     window._ftAlertConfigSync = function (cfg) {
       var upd = { ft_alert_config: cfg };
       // Inclui o timestamp da edição (salvo em localStorage por saveConfig)
@@ -7183,13 +7185,15 @@ var FIRESTORE_DOC_ID     = 'dados';
         var tsCfg = parseInt(localStorage.getItem('ft_alert_config_ts') || '0', 10);
         if (tsCfg) upd['ft_alert_config_ts'] = tsCfg;
       } catch(e) {}
-      // Grava ft_escalas_custom junto para manter consistência entre dispositivos
-      try {
-        var esc = JSON.parse(localStorage.getItem('ft_escalas_custom') || '{}');
-        if (Object.keys(esc).length > 0) upd['ft_escalas_custom'] = esc;
-        var tsEsc = parseInt(localStorage.getItem('ft_escalas_custom_ts') || '0', 10);
-        if (tsEsc) upd['ft_escalas_custom_ts'] = tsEsc;
-      } catch(e) {}
+      // BUG CORRIGIDO: esta função gravava também o ft_escalas_custom atual
+      // junto com a config, em PARALELO com a gravação própria das escalas
+      // (em salvarEscalaCustom). Como são duas gravações assíncronas
+      // independentes sem ordem garantida, salvar uma config (ex.: ativar/
+      // desativar alerta, adicionar um posto) podia chegar ao Firestore
+      // DEPOIS de um turno recém-adicionado e sobrescrevê-lo com um valor
+      // de escala mais antigo — o turno "desaparecia" para os outros
+      // dispositivos. As escalas agora têm seu próprio caminho exclusivo de
+      // sincronização (a fila), então não são mais duplicadas aqui.
       db.collection(FIRESTORE_COLLECTION)
         .doc(FIRESTORE_DOC_ID)
         .set(upd, { merge: true })
@@ -7944,26 +7948,30 @@ var FIRESTORE_DOC_ID     = 'dados';
       // ── Timestamp da edição: salvo em localStorage (sobrevive a reload).
       //    É comparado pelo listener onSnapshot para decidir se um dado
       //    remoto pode sobrescrever esta edição local ou não.
-      try { localStorage.setItem('ft_alert_config_ts', String(Date.now())); } catch (e) {}
-      if (typeof window._ftAlertConfigSync === 'function') {
-        try { window._ftAlertConfigSync(cfg); } catch (e) {}
-      } else {
-        // Firebase ainda não conectou — guarda para enviar assim que conectar
-        window._ftAlertConfigPending = cfg;
-      }
-      // Reforço de durabilidade: também enfileira no IndexedDB (mesma fila usada
-      // por colaboradores/postos/registros). Diferente da variável "_ftAlertConfigPending"
-      // (perdida se a aba fechar antes de reconectar), a fila persiste e é
-      // reenviada automaticamente no próximo flush/abertura do app — corrige
-      // o caso de a config de alertas ficar "presa" sem sincronizar quando
-      // salva sem conexão.
+      var _tsCfg = Date.now();
+      try { localStorage.setItem('ft_alert_config_ts', String(_tsCfg)); } catch (e) {}
+      // ── Sincroniza com Firestore SOMENTE através da fila (FT_SyncQueue) ──
+      //    BUG CORRIGIDO: antes a gravação direta (via _ftAlertConfigSync)
+      //    rodava em PARALELO com a fila, e ainda incluía por "segurança" o
+      //    valor atual de ft_escalas_custom. Como duas escritas assíncronas
+      //    independentes não chegam ao Firestore em ordem garantida, salvar
+      //    uma config (ativar/desativar alerta, adicionar/remover posto)
+      //    podia sobrescrever no servidor um turno recém-adicionado em
+      //    outra ação, com um valor de escala mais antigo. A fila grava em
+      //    ordem, um item por vez — elimina essa corrida.
       if (window.FT_SyncQueue) {
         FT_SyncQueue.enqueue('set', LS_CONFIG, cfg).then(function() {
           if (window.SyncEngine) SyncEngine.flush();
         });
-        FT_SyncQueue.enqueue('set', 'ft_alert_config_ts', parseInt(localStorage.getItem('ft_alert_config_ts')||'0',10)).then(function() {
+        FT_SyncQueue.enqueue('set', 'ft_alert_config_ts', _tsCfg).then(function() {
           if (window.SyncEngine) SyncEngine.flush();
         });
+      } else if (typeof window._ftAlertConfigSync === 'function') {
+        // Fallback: só usado se a fila IndexedDB estiver indisponível neste navegador
+        try { window._ftAlertConfigSync(cfg); } catch (e) {}
+      } else {
+        // Nem fila nem Firebase disponíveis ainda — guarda para enviar assim que conectar
+        window._ftAlertConfigPending = cfg;
       }
     }
   }
