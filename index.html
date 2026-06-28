@@ -14,10 +14,40 @@
 <meta name="apple-mobile-web-app-title" content="FT">
 <script>
   if ('serviceWorker' in navigator) {
+    // ── Auto-reload quando uma versão nova do Service Worker assume o controle ──
+    // BUG: o service-worker.js já tinha skipWaiting()+clients.claim(), então a
+    // versão nova assume o controle pouco depois de um deploy — mas a aba que
+    // já estava aberta continuava executando o JS ANTIGO (já carregado em
+    // memória) indefinidamente, mesmo com o app instalado como PWA e mesmo
+    // depois de corrigido um bug no servidor. Era preciso fechar e reabrir o
+    // app manualmente para realmente receber o código novo. Este listener
+    // recarrega a página UMA vez quando isso acontece, garantindo que o
+    // index.html (e o JS dele) carregado seja sempre o mais recente.
+    var _swRefreshing = false;
+    navigator.serviceWorker.addEventListener('controllerchange', function() {
+      if (_swRefreshing) return;
+      _swRefreshing = true;
+      window.location.reload();
+    });
+
     window.addEventListener('load', function() {
       // Registra o SW principal (PWA + cache)
       navigator.serviceWorker.register('/Novafolgatrabalhada2/service-worker.js')
-        .then(function(reg) { console.log('[SW] Registrado:', reg.scope); })
+        .then(function(reg) {
+          console.log('[SW] Registrado:', reg.scope);
+          // Verifica se há uma versão nova agora, em vez de esperar o
+          // intervalo padrão do navegador (que pode levar até 24h).
+          reg.update().catch(function(){});
+          // Verifica de novo sempre que o app volta a ficar visível — cobre o
+          // caso comum em celular de reabrir o PWA pelos "recentes" sem ele
+          // ter sido encerrado de fato, onde o app fica "parado" numa versão
+          // antiga até alguém forçar uma checagem.
+          document.addEventListener('visibilitychange', function() {
+            if (document.visibilityState === 'visible') {
+              reg.update().catch(function(){});
+            }
+          });
+        })
         .catch(function(err) { console.warn('[SW] Falhou:', err); });
     });
   }
