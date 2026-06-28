@@ -8812,11 +8812,19 @@ window._ftSalvarAlertConfigFirebase = function(cfg, ts) {
     if (_ftMigracaoEscalaJaExecutada) return;
     _ftMigracaoEscalaJaExecutada = true;
     var cfgMig = loadConfig();
+    var _customMig = loadEscalasCustom(); // BUG CORRIGIDO: verifica também localStorage
     cfgMig.postos.forEach(function(posto) {
       var normP = norm(posto);
       var temEscala = false;
+      // 1) verifica em memória
       for (var k in ESCALAS_POSTOS) {
         if (norm(k) === normP) { temEscala = true; break; }
+      }
+      // 2) verifica no localStorage (evita sobrescrever escala custom já salva)
+      if (!temEscala) {
+        for (var kc in _customMig) {
+          if (norm(kc) === normP) { temEscala = true; break; }
+        }
       }
       if (!temEscala) {
         var semanaDefault = [];
@@ -9028,6 +9036,13 @@ window._ftSalvarAlertConfigFirebase = function(cfg, ts) {
         var normValCfg = norm(val);
         for (var k in ESCALAS_POSTOS) {
           if (norm(k) === normValCfg) { temEscala = true; break; }
+        }
+        // BUG CORRIGIDO: verifica também localStorage antes de injetar padrão
+        if (!temEscala) {
+          var _customCfg = loadEscalasCustom();
+          for (var kc in _customCfg) {
+            if (norm(kc) === normValCfg) { temEscala = true; break; }
+          }
         }
         if (!temEscala) {
           var semanaDefault = [];
@@ -9246,14 +9261,26 @@ window._ftSalvarAlertConfigFirebase = function(cfg, ts) {
       saveConfig(cfg);
 
       /* ── Garante que o posto novo tem escala para gerar alertas ─────────
-         Se não existe escala hardcoded nem customizada, injeta escala
-         padrão 24h (Dia 06→18 + Noite 18→06) em todos os dias da semana.
-         Isso permite que o alerta funcione imediatamente sem forçar o
-         usuário a configurar escala manualmente. ──────────────────────── */
+         Se não existe escala hardcoded NEM customizada (localStorage),
+         injeta escala padrão 24h (Noite 18→06) em todos os dias da semana.
+         BUG CORRIGIDO: a verificação anterior só consultava ESCALAS_POSTOS
+         em memória, ignorando escalas customizadas já salvas no localStorage.
+         Após um reload, ESCALAS_POSTOS é reconstruído na inicialização, mas
+         neste ponto do código ele pode ainda não conter a escala custom —
+         causando sobrescrita do horário configurado pelo usuário com 18:00–06:00.
+         Agora verificamos também loadEscalasCustom() antes de injetar. ──────── */
       var temEscala = false;
       var normValChk = norm(val);
+      // 1) verifica em memória (hardcoded + custom já carregadas no init)
       for (var k in ESCALAS_POSTOS) {
         if (norm(k) === normValChk) { temEscala = true; break; }
+      }
+      // 2) verifica no localStorage (custom salvas que podem não estar em memória ainda)
+      if (!temEscala) {
+        var _customChk = loadEscalasCustom();
+        for (var kc in _customChk) {
+          if (norm(kc) === normValChk) { temEscala = true; break; }
+        }
       }
       if (!temEscala) {
         var semanaDefault = [];
@@ -9423,9 +9450,14 @@ window._ftSalvarAlertConfigFirebase = function(cfg, ts) {
       cfg.postos.push(val);
       saveConfig(cfg);
 
-      // Garante escala noturna padrão se não tiver escala
+      // Garante escala noturna padrão se não tiver escala (hardcoded nem custom)
       var temEscala = false;
       for (var k in ESCALAS_POSTOS) { if (norm(k) === normVal) { temEscala = true; break; } }
+      // BUG CORRIGIDO: verifica também localStorage antes de injetar padrão
+      if (!temEscala) {
+        var _customCad = loadEscalasCustom();
+        for (var kcc in _customCad) { if (norm(kcc) === normVal) { temEscala = true; break; } }
+      }
       if (!temEscala) {
         var semanaDefault = [];
         for (var d = 0; d < 7; d++) {
