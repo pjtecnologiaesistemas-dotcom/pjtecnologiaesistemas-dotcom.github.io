@@ -7145,8 +7145,9 @@ window._ftSalvarEscalaFirebase = function(custom, ts) {
   console.log('[EscalaSync] Firebase ainda não conectado — dados pendentes em memória.');
 };
 window._ftSalvarAlertConfigFirebase = function(cfg, ts) {
-  window._ftAlertConfigPending = cfg;
-  console.log('[AlertConfigSync] Firebase ainda não conectado — config pendente em memória.');
+  // Firebase ainda não conectou — guarda cfg E ts para enviar assim que conectar
+  window._ftAlertConfigPending   = cfg;
+  window._ftAlertConfigPendingTs = ts || Date.now();
 };
 
 // ─────────────────────────────────────────────────────────────
@@ -7247,10 +7248,16 @@ window._ftSalvarAlertConfigFirebase = function(cfg, ts) {
         .catch(function (e) { console.warn('[AlertSync] Erro ao gravar config:', e); });
     };
 
-    // ── Dispara config que foi salva antes do Firebase conectar ──
+    // ── Flush de alert_config salvo antes do Firebase conectar ──
     if (window._ftAlertConfigPending) {
-      try { window._ftAlertConfigSync(window._ftAlertConfigPending); } catch(e) {}
-      window._ftAlertConfigPending = null;
+      try {
+        window._ftSalvarAlertConfigFirebase(
+          window._ftAlertConfigPending,
+          window._ftAlertConfigPendingTs || Date.now()
+        );
+      } catch(e) {}
+      window._ftAlertConfigPending   = null;
+      window._ftAlertConfigPendingTs = null;
     }
 
     // ── Dispara ft_escalas_custom pendente (salva antes do Firebase conectar) ──
@@ -7272,7 +7279,7 @@ window._ftSalvarAlertConfigFirebase = function(cfg, ts) {
     // ── Listener em tempo real (recebe mudanças de outros dispositivos) ──
     db.collection(FIRESTORE_COLLECTION)
       .doc(FIRESTORE_DOC_ID)
-      .onSnapshot(function (doc) {
+      .onSnapshot({ includeMetadataChanges: true }, function (doc) {
         if (!doc.exists) return;
         var data = doc.data();
 
@@ -7300,7 +7307,7 @@ window._ftSalvarAlertConfigFirebase = function(cfg, ts) {
         if (data['ft_escalas_custom'] !== undefined) {
           var remoteTsEsc = parseInt(data['ft_escalas_custom_ts'] || 0, 10) || 0;
           var localTsEsc  = parseInt(localStorage.getItem('ft_escalas_custom_ts') || '0', 10) || 0;
-          if (remoteTsEsc > localTsEsc) {  // FIX: > evita snapshot sobrescrever edição local com mesmo ts
+          if (remoteTsEsc >= localTsEsc) {  // >= aceita mesmo ts (outro dispositivo, mesmo segundo)
             try { localStorage.setItem('ft_escalas_custom', JSON.stringify(data['ft_escalas_custom'])); } catch (e) {}
             try { localStorage.setItem('ft_escalas_custom_ts', String(remoteTsEsc)); } catch (e) {}
             if (window.FT_Store) FT_Store.set('ft_escalas_custom', data['ft_escalas_custom']);
@@ -7316,7 +7323,7 @@ window._ftSalvarAlertConfigFirebase = function(cfg, ts) {
         if (data['ft_alert_config'] !== undefined) {
           var remoteTsCfg = parseInt(data['ft_alert_config_ts'] || 0, 10) || 0;
           var localTsCfg  = parseInt(localStorage.getItem('ft_alert_config_ts') || '0', 10) || 0;
-          if (remoteTsCfg > localTsCfg) {  // FIX: > evita snapshot sobrescrever config local
+          if (remoteTsCfg >= localTsCfg) {  // >= aceita mesmo ts (outro dispositivo, mesmo segundo)
           var remotoCfg = data['ft_alert_config'];
           // Sempre aplica: normaliza pela serialização para comparação estável
           var localRaw  = localStorage.getItem('ft_alert_config') || 'null';
@@ -7371,21 +7378,25 @@ window._ftSalvarAlertConfigFirebase = function(cfg, ts) {
 
         // Reavalia alertas imediatamente quando dados mudam
         if (chavesAtualizadas.length > 0 || escalasAtualizadas || alertCfgAtualizado) {
-          // Ignora snapshots gerados pela própria escrita local (fromCache=true)
-          // para não processar duas vezes a mesma mudança
-          var fromCache = doc.metadata && doc.metadata.fromCache;
-          if (!fromCache) {
+          // Com includeMetadataChanges:true:
+          //   fromCache=true  → dado ainda no cache local (escrita pendente)
+          //   fromCache=false → dado confirmado pelo servidor Firestore
+          // Só dispara alerta quando dado vem do servidor (outro dispositivo OU
+          // confirmação da própria escrita — ambos têm fromCache=false)
+          var fromCache      = !!(doc.metadata && doc.metadata.fromCache);
+          var hasPending     = !!(doc.metadata && doc.metadata.hasPendingWrites);
+          var dadoDoServidor = !fromCache && !hasPending;
+
+          if (dadoDoServidor) {
             setTimeout(function () {
-              // Usa _ftScheduledCheck: respeita isAlertTime() + isSnoozed()
-              // e chama checkAndAlert internamente com a referência real
               if (typeof window._ftScheduledCheck === 'function') {
                 window._ftScheduledCheck();
               } else if (typeof window._ftUpdateBadge === 'function') {
                 window._ftUpdateBadge();
               }
-            }, 500);
+            }, 400);
           } else {
-            // Para snapshots locais, só atualiza o badge (sem modal)
+            // Cache local: só atualiza badge sem abrir modal
             setTimeout(function () {
               if (typeof window._ftUpdateBadge === 'function') window._ftUpdateBadge();
             }, 300);
