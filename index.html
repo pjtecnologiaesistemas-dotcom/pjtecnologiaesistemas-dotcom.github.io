@@ -7371,15 +7371,25 @@ window._ftSalvarAlertConfigFirebase = function(cfg, ts) {
 
         // Reavalia alertas imediatamente quando dados mudam
         if (chavesAtualizadas.length > 0 || escalasAtualizadas || alertCfgAtualizado) {
-          setTimeout(function () {
-            if (typeof window._ftCheckAndAlert === 'function') {
-              window._ftCheckAndAlert();
-            } else if (typeof window._ftScheduledCheck === 'function') {
-              window._ftScheduledCheck();
-            } else if (typeof window._ftUpdateBadge === 'function') {
-              window._ftUpdateBadge();
-            }
-          }, 500);
+          // Ignora snapshots gerados pela própria escrita local (fromCache=true)
+          // para não processar duas vezes a mesma mudança
+          var fromCache = doc.metadata && doc.metadata.fromCache;
+          if (!fromCache) {
+            setTimeout(function () {
+              // Usa _ftScheduledCheck: respeita isAlertTime() + isSnoozed()
+              // e chama checkAndAlert internamente com a referência real
+              if (typeof window._ftScheduledCheck === 'function') {
+                window._ftScheduledCheck();
+              } else if (typeof window._ftUpdateBadge === 'function') {
+                window._ftUpdateBadge();
+              }
+            }, 500);
+          } else {
+            // Para snapshots locais, só atualiza o badge (sem modal)
+            setTimeout(function () {
+              if (typeof window._ftUpdateBadge === 'function') window._ftUpdateBadge();
+            }, 300);
+          }
         }
 
         // ft_alert_config já tratado acima junto com ft_escalas_custom
@@ -7557,14 +7567,22 @@ window._ftSalvarAlertConfigFirebase = function(cfg, ts) {
   function hookAlertModule() {
     if (window._ftCheckAndAlertOriginal) return; // já hookeado
     window._ftCheckAndAlertOriginal = true;
-    var realFn = (typeof window._ftCheckAndAlert === 'function') ? window._ftCheckAndAlert : null;
-    Object.defineProperty(window, '_ftCheckAndAlert', {
-      configurable: true,
-      get: function () { return wrapped; },
-      set: function (fn) { realFn = fn; }
-    });
+
+    // FIX: em vez de capturar _ftCheckAndAlert por valor (que podia ser undefined
+    // antes do init() do módulo de alertas rodar), guarda uma referência separada
+    // e re-expõe _ftCheckAndAlert como wrapper que chama o real por nome, sem
+    // Object.defineProperty que causava race condition entre os módulos.
+    var _realCheckAndAlert = null;
+
     function wrapped() {
-      if (typeof realFn === 'function') realFn();
+      // Busca a função real no momento da chamada (não no momento do hook)
+      if (_realCheckAndAlert === null) {
+        // Primeira chamada: tenta localizar a função real salva antes do wrapper
+        _realCheckAndAlert = window._ftCheckAndAlertReal || null;
+      }
+      if (typeof _realCheckAndAlert === 'function') {
+        try { _realCheckAndAlert(); } catch(e) {}
+      }
       // Dispara push local se há pendências
       setTimeout(function () {
         try {
@@ -7575,6 +7593,13 @@ window._ftSalvarAlertConfigFirebase = function(cfg, ts) {
         } catch (e) {}
       }, 600);
     }
+
+    // Salva referência real ANTES de sobrescrever
+    if (typeof window._ftCheckAndAlert === 'function') {
+      window._ftCheckAndAlertReal = window._ftCheckAndAlert;
+      _realCheckAndAlert = window._ftCheckAndAlert;
+    }
+    window._ftCheckAndAlert = wrapped;
   }
 
   // Aguarda Firebase carregar e então inicializa FCM
@@ -8977,7 +9002,17 @@ window._ftSalvarAlertConfigFirebase = function(cfg, ts) {
       btnDel.type = 'button';
       btnDel.style.cssText = 'border:none;background:rgba(139,151,176,.1);color:#8b97b0;border-radius:7px;padding:3px 7px;font-size:.78rem;font-weight:700;cursor:pointer;';
       btnDel.textContent = '\u2715';
-      btnDel.onclick = function () { cfg.postos.splice(idx, 1); saveConfig(cfg); renderConfigPostos(); updateHeaderBadge(); };
+      // FIX: captura posto por nome (não por idx) para garantir exclusão correta
+      // independente de re-renders ou closures com idx desatualizado
+      (function(postoNome) {
+        btnDel.onclick = function () {
+          var cfgAtual = loadConfig();
+          cfgAtual.postos = cfgAtual.postos.filter(function(p) { return p !== postoNome; });
+          saveConfig(cfgAtual);
+          renderConfigPostos();
+          updateHeaderBadge();
+        };
+      })(posto);
 
       linha1.appendChild(lbl);
       linha1.appendChild(btnDia2);
@@ -9152,10 +9187,23 @@ window._ftSalvarAlertConfigFirebase = function(cfg, ts) {
     setTimeout(scheduledCheck, 1500);
 
     // Expõe funções internas ao listener Firestore e ao módulo de diagnóstico
-    window._ftScheduledCheck  = scheduledCheck;
-    window._ftCheckAndAlert   = checkAndAlert;
-    window._ftUpdateBadge     = updateHeaderBadge;
-    window._ftGetPendencias   = getPendencias;   // usado pelo módulo FCM
+    window._ftScheduledCheck      = scheduledCheck;
+    window._ftCheckAndAlertReal   = checkAndAlert;  // referência real para o hook FCM
+    window._ftCheckAndAlert       = checkAndAlert;  // pode ser wrapped pelo hookAlertModule
+    window._ftUpdateBadge         = updateHeaderBadge;
+    window._ftGetPendencias       = getPendencias;  // usado pelo módulo FCM
+
+    // Se o hook FCM já rodou antes deste init(), atualiza a referência real nele
+    if (window._ftCheckAndAlertOriginal) {
+      window._ftCheckAndAlertReal = checkAndAlert;
+      // Re-expõe o wrapper com a referência correta
+      if (typeof window._ftCheckAndAlert === 'function' &&
+          window._ftCheckAndAlert !== checkAndAlert) {
+        // Já está wrapped — só atualiza _ftCheckAndAlertReal que o wrapper lê
+      } else {
+        window._ftCheckAndAlert = checkAndAlert;
+      }
+    }
 
     // _ftAlertRender: re-renderiza toda a UI de alertas com a config atual do localStorage
     window._ftAlertRender = function() {
