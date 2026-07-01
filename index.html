@@ -7121,8 +7121,11 @@
      ════════════════════════════════════════════════════════ -->
 <script>
 
-// ── 1. SUAS CREDENCIAIS FIREBASE ──────────────────────────────
-//      Substitua pelos valores do seu projeto
+// ══════════════════════════════════════════════════════════════
+//  MÓDULO FIREBASE — Sincronização em tempo real
+//  Reescrito do zero para sincronismo confiável de alertas
+// ══════════════════════════════════════════════════════════════
+
 var FIREBASE_CONFIG = {
   apiKey:            "AIzaSyA6OzNUzlHVJaG3CsnQ3m-cfcuOkf6Ve-Q",
   authDomain:        "nova-folga-trabalhada.firebaseapp.com",
@@ -7132,66 +7135,216 @@ var FIREBASE_CONFIG = {
   appId:             "1:187145497152:web:8f943193dffdadd2340da5"
 };
 
-// ── 2. ID DO DOCUMENTO ÚNICO NO FIRESTORE ────────────────────
-//      Todos os dados ficam em: /folga_trabalhada/dados
 var FIRESTORE_COLLECTION = 'folga_trabalhada';
 var FIRESTORE_DOC_ID     = 'dados';
 
-// Stubs — substituídos por implementações reais após Firebase conectar.
-// Evitam "window._ftSalvarEscalaFirebase is not a function" durante carregamento.
+// ── Stubs: evitam "is not a function" antes do Firebase conectar ──
+// Quando chamados antes da conexão, guardam o dado para envio posterior.
 window._ftSalvarEscalaFirebase = function(custom, ts) {
-  window._ftEscalaCustomPending   = custom;
-  window._ftEscalaCustomPendingTs = ts || Date.now();
-  console.log('[EscalaSync] Firebase ainda não conectado — dados pendentes em memória.');
+  window._ftPending = window._ftPending || {};
+  window._ftPending.escala   = { data: custom, ts: ts || Date.now() };
 };
 window._ftSalvarAlertConfigFirebase = function(cfg, ts) {
-  // Firebase ainda não conectou — guarda cfg E ts para enviar assim que conectar
-  window._ftAlertConfigPending   = cfg;
-  window._ftAlertConfigPendingTs = ts || Date.now();
+  window._ftPending = window._ftPending || {};
+  window._ftPending.alertCfg = { data: cfg,    ts: ts || Date.now() };
 };
-
-// ─────────────────────────────────────────────────────────────
+window._ftFirebaseConectado = false;
 
 (function () {
   'use strict';
 
-  // Carrega o SDK Firebase via CDN
-  // CRÍTICO: tem onerror + 1 retry — sem isso, uma falha de rede em QUALQUER
-  // script da cadeia (ex.: CDN bloqueado por ad-blocker) travava o
-  // encadeamento para sempre e o app nunca conectava ao Firestore,
-  // mesmo sem nenhum erro visível no console do usuário.
-  function loadScript(src, cb, _isRetry) {
+  // ── Carrega script via CDN com retry ──────────────────────
+  function loadScript(src, cb, retry) {
     var s = document.createElement('script');
     s.src = src;
     s.onload = cb;
     s.onerror = function () {
-      if (_isRetry) {
-        console.warn('[FirebaseSync] Falha definitiva ao carregar script:', src);
-        return; // desiste após 1 retry — não bloqueia o resto do app
-      }
-      console.warn('[FirebaseSync] Falha ao carregar script, tentando novamente:', src);
+      if (retry) { console.warn('[FB] Falha definitiva:', src); return; }
+      console.warn('[FB] Retry:', src);
       setTimeout(function () { loadScript(src, cb, true); }, 1500);
     };
     document.head.appendChild(s);
   }
 
-  function initFirebase() {
-    // Inicializa app Firebase (evita re-inicialização)
-    var app;
-    try {
-      app = firebase.app();
-    } catch (e) {
-      app = firebase.initializeApp(FIREBASE_CONFIG);
+  // ── Referência ao db (usado fora do initFirebase para snooze etc.) ──
+  var _db = null;
+
+  // ── Listener ativo (para poder cancelar e recriar se necessário) ──
+  var _unsubscribe = null;
+
+  // ── Ultima versão local de cada campo sincronizado ──────────
+  // Permite ignorar snapshots que chegam com dados mais antigos
+  // que a edição local mais recente.
+  function getLocalTs(key) {
+    return parseInt(localStorage.getItem(key + '_ts') || '0', 10) || 0;
+  }
+  function setLocalTs(key, ts) {
+    try { localStorage.setItem(key + '_ts', String(ts)); } catch(e) {}
+  }
+
+  // ── Aplica dado remoto no localStorage apenas se for mais novo ──
+  // Retorna true se aplicou (dado era mais novo ou igual do servidor).
+  function aplicarSeNovo(key, valor, tsRemoto) {
+    var tsLocal = getLocalTs(key);
+    // Se não temos timestamp local, sempre aplica
+    if (tsRemoto > 0 && tsLocal > tsRemoto) {
+      // Nossa edição local é mais nova — ignora este snapshot
+      return false;
     }
+    try { localStorage.setItem(key, JSON.stringify(valor)); } catch(e) {}
+    if (window.FT_Store) try { FT_Store.set(key, valor); } catch(e) {}
+    if (tsRemoto > 0) setLocalTs(key, tsRemoto);
+    return true;
+  }
+
+  // ── Cria / recria o listener onSnapshot ───────────────────
+  function criarListener(db) {
+    if (_unsubscribe) { try { _unsubscribe(); } catch(e) {} }
+
+    _unsubscribe = db
+      .collection(FIRESTORE_COLLECTION)
+      .doc(FIRESTORE_DOC_ID)
+      // includeMetadataChanges=true: recebe notificação quando dado
+      // sai do cache local e é confirmado pelo servidor Firestore.
+      // Sem isso, fromCache nunca transitaria e não saberíamos distinguir
+      // escrita local de dado vindo de outro dispositivo.
+      .onSnapshot({ includeMetadataChanges: true }, function (doc) {
+        if (!doc.exists) return;
+
+        // fromCache=true  → dado ainda no cache local (escrita pendente)
+        // fromCache=false + hasPendingWrites=false → confirmação do servidor
+        var fromCache  = !!(doc.metadata && doc.metadata.fromCache);
+        var hasPending = !!(doc.metadata && doc.metadata.hasPendingWrites);
+        // "dadoServidor" = snapshot veio do Firestore real, não do cache local
+        var dadoServidor = !fromCache && !hasPending;
+
+        var data = doc.data() || {};
+
+        // ── Campos simples (arrays): aplica sempre que servidor confirma ──
+        // Esses campos não têm controle de timestamp — o servidor é a fonte
+        // de verdade. Só aplicamos quando não é cache local para não
+        // sobrescrever uma edição que ainda não foi ao servidor.
+        var camposSimples = [
+          'ft_registros', 'ft_colaboradores', 'ft_postos',
+          'ft_bico_fixo', 'ft_horarios_custom'
+        ];
+        var chavesUI = [];
+
+        if (dadoServidor) {
+          camposSimples.forEach(function (key) {
+            if (data[key] !== undefined) {
+              try { localStorage.setItem(key, JSON.stringify(data[key])); } catch(e) {}
+              if (window.FT_Store) try { FT_Store.set(key, data[key]); } catch(e) {}
+              chavesUI.push(key);
+            }
+          });
+        }
+
+        // ── ft_escalas_custom: controle por timestamp ─────────────────
+        // Mesmo em cache local, aplicamos se veio do servidor com ts mais novo.
+        // Isso garante que edições de outro dispositivo chegam mesmo se este
+        // dispositivo também editou (o mais recente vence).
+        if (data['ft_escalas_custom'] !== undefined) {
+          var tsEscRemoto = parseInt(data['ft_escalas_custom_ts'] || 0, 10) || 0;
+          if (aplicarSeNovo('ft_escalas_custom', data['ft_escalas_custom'], tsEscRemoto)) {
+            if (dadoServidor) chavesUI.push('ft_escalas_custom');
+            // Recarrega ESCALAS_POSTOS em memória com os novos dados
+            if (typeof window._ftRecarregarEscalas === 'function') {
+              try { window._ftRecarregarEscalas(); } catch(e) {}
+            }
+          }
+        }
+
+        // ── ft_alert_config: controle por timestamp ───────────────────
+        var alertCfgAtualizado = false;
+        if (data['ft_alert_config'] !== undefined) {
+          var tsCfgRemoto = parseInt(data['ft_alert_config_ts'] || 0, 10) || 0;
+          var tsCfgLocal  = getLocalTs('ft_alert_config');
+
+          // Aplica se: servidor tem ts mais novo OU não há ts local ainda
+          if (tsCfgRemoto >= tsCfgLocal || tsCfgLocal === 0) {
+            var remotoRaw = JSON.stringify(data['ft_alert_config']);
+            var localRaw  = localStorage.getItem('ft_alert_config') || 'null';
+            if (remotoRaw !== localRaw) {
+              window._ftApplyingRemote = true;
+              try { localStorage.setItem('ft_alert_config', remotoRaw); } catch(e) {}
+              window._ftApplyingRemote = false;
+              if (tsCfgRemoto > 0) setLocalTs('ft_alert_config', tsCfgRemoto);
+              alertCfgAtualizado = true;
+            }
+          }
+        }
+
+        // ── ft_ciclo_inicio ───────────────────────────────────────────
+        if (data['ft_ciclo_inicio'] !== undefined) {
+          try { localStorage.setItem('ft_ciclo_inicio', String(data['ft_ciclo_inicio'])); } catch(e) {}
+        }
+
+        // ── ft_alert_snoozed ──────────────────────────────────────────
+        if (data['ft_alert_snoozed'] !== undefined) {
+          try {
+            if (!data['ft_alert_snoozed']) localStorage.removeItem('ft_alert_snoozed');
+            else localStorage.setItem('ft_alert_snoozed', String(data['ft_alert_snoozed']));
+          } catch(e) {}
+        }
+
+        // ── Atualiza UI ───────────────────────────────────────────────
+        if (alertCfgAtualizado) {
+          if (typeof window._ftAlertRender === 'function') {
+            try { window._ftAlertRender(); } catch(e) {}
+          }
+        }
+
+        if (chavesUI.length > 0) {
+          if (typeof window._ftAplicarDadosRemotos === 'function') {
+            try { window._ftAplicarDadosRemotos(chavesUI); } catch(e) {}
+          }
+        }
+
+        // ── Dispara verificação de alertas quando dado vem do servidor ──
+        // Só quando é confirmação real do servidor (não cache local),
+        // para evitar disparar o modal duas vezes para a mesma mudança.
+        if (dadoServidor && (chavesUI.length > 0 || alertCfgAtualizado)) {
+          setTimeout(function () {
+            if (typeof window._ftScheduledCheck === 'function') {
+              window._ftScheduledCheck();
+            } else if (typeof window._ftUpdateBadge === 'function') {
+              window._ftUpdateBadge();
+            }
+          }, 400);
+        } else if (alertCfgAtualizado || chavesUI.length > 0) {
+          // Cache local: apenas atualiza badge sem modal
+          setTimeout(function () {
+            if (typeof window._ftUpdateBadge === 'function') window._ftUpdateBadge();
+          }, 200);
+        }
+
+        // Notifica UI geral
+        if (typeof window.onSyncComplete === 'function') {
+          try { window.onSyncComplete(true); } catch(e) {}
+        }
+
+      }, function (err) {
+        console.warn('[FB] Listener error:', err.code, err.message);
+        // Recria listener após erro (rede instável etc.)
+        setTimeout(function () {
+          if (_db) criarListener(_db);
+        }, 5000);
+      });
+  }
+
+  // ── Inicializa Firebase e cria listener ───────────────────
+  function initFirebase() {
+    var app;
+    try { app = firebase.app(); }
+    catch(e) { app = firebase.initializeApp(FIREBASE_CONFIG); }
 
     var db = firebase.firestore();
+    _db = db;
 
-    // ── Handler remoto registrado no SyncEngine ──────────────
-    // Recebe cada entrada da fila e grava no Firestore
+    // ── Registra o handler de escrita no SyncEngine ──────────
     if (window.SyncEngine) {
       SyncEngine.setRemote(function (entry) {
-        // entry = { qid, op, store, payload, ts }
-        // Stores com prefixo __ carregam payload multi-campo (atômico).
         var update;
         if (typeof entry.store === 'string' && entry.store.indexOf('__') === 0
             && entry.payload && typeof entry.payload === 'object') {
@@ -7206,277 +7359,81 @@ window._ftSalvarAlertConfigFirebase = function(cfg, ts) {
           .set(update, { merge: true })
           .then(function () { return true; })
           .catch(function (err) {
-            console.warn('[FirebaseSync] Falha ao sincronizar:', err);
+            console.warn('[FB] Falha ao sincronizar:', err);
             return false;
           });
       });
-
-      // ── Flush imediato: drena tudo que foi enfileirado enquanto
-      //    o SDK Firebase ainda estava carregando via CDN. Sem isto,
-      //    lançamentos feitos antes do Firebase conectar ficavam presos
-      //    na fila IndexedDB e nunca chegavam ao Firestore.
-      // Garante que _online=true pois Firebase só inicializa com conexão ativa
       SyncEngine._online = navigator.onLine;
-      console.log('[FirebaseSync] Handler registrado — drenando fila pendente…');
       SyncEngine.flush();
     }
 
-    // ── Bridge de escrita: usada como FALLBACK (quando a fila IndexedDB não
-    //    está disponível) e para reenviar o que ficou pendente de antes do
-    //    Firebase conectar. Não é mais o caminho principal — ver saveConfig().
-    window._ftAlertConfigSync = function (cfg) {
-      var upd = { ft_alert_config: cfg };
-      // Inclui o timestamp da edição (salvo em localStorage por saveConfig)
-      // para que o listener onSnapshot, em qualquer dispositivo, saiba se
-      // este dado é mais novo que o que ele já tem antes de aplicá-lo.
-      try {
-        var tsCfg = parseInt(localStorage.getItem('ft_alert_config_ts') || '0', 10);
-        if (tsCfg) upd['ft_alert_config_ts'] = tsCfg;
-      } catch(e) {}
-      // BUG CORRIGIDO: esta função gravava também o ft_escalas_custom atual
-      // junto com a config, em PARALELO com a gravação própria das escalas
-      // (em salvarEscalaCustom). Como são duas gravações assíncronas
-      // independentes sem ordem garantida, salvar uma config (ex.: ativar/
-      // desativar alerta, adicionar um posto) podia chegar ao Firestore
-      // DEPOIS de um turno recém-adicionado e sobrescrevê-lo com um valor
-      // de escala mais antigo — o turno "desaparecia" para os outros
-      // dispositivos. As escalas agora têm seu próprio caminho exclusivo de
-      // sincronização (a fila), então não são mais duplicadas aqui.
+    // ── Implementações reais das funções de gravação ──────────
+    window._ftSalvarEscalaFirebase = function(custom, ts) {
+      var payload = { ft_escalas_custom: custom };
+      if (ts) payload['ft_escalas_custom_ts'] = ts;
       db.collection(FIRESTORE_COLLECTION)
         .doc(FIRESTORE_DOC_ID)
-        .set(upd, { merge: true })
-        .catch(function (e) { console.warn('[AlertSync] Erro ao gravar config:', e); });
-    };
-
-    // ── Flush de alert_config salvo antes do Firebase conectar ──
-    if (window._ftAlertConfigPending) {
-      try {
-        window._ftSalvarAlertConfigFirebase(
-          window._ftAlertConfigPending,
-          window._ftAlertConfigPendingTs || Date.now()
-        );
-      } catch(e) {}
-      window._ftAlertConfigPending   = null;
-      window._ftAlertConfigPendingTs = null;
-    }
-
-    // ── Dispara ft_escalas_custom pendente (salva antes do Firebase conectar) ──
-    if (window._ftEscalaCustomPending) {
-      try {
-        var col = FIRESTORE_COLLECTION || 'folga_trabalhada';
-        var did = FIRESTORE_DOC_ID     || 'dados';
-        var updEsc = { ft_escalas_custom: window._ftEscalaCustomPending };
-        if (window._ftEscalaCustomPendingTs) updEsc['ft_escalas_custom_ts'] = window._ftEscalaCustomPendingTs;
-        db.collection(col).doc(did)
-          .set(updEsc, { merge: true })
-          .catch(function(e){ console.warn('[EscalaSync pending]', e); });
-        window._ftEscalaCustomPending = null;
-        window._ftEscalaCustomPendingTs = null;
-      } catch(e) {}
-    }
-
-
-    // ── Listener em tempo real (recebe mudanças de outros dispositivos) ──
-    db.collection(FIRESTORE_COLLECTION)
-      .doc(FIRESTORE_DOC_ID)
-      .onSnapshot({ includeMetadataChanges: true }, function (doc) {
-        if (!doc.exists) return;
-        var data = doc.data();
-
-        // Atualiza localStorage e IndexedDB com dados remotos
-        var chavesAtualizadas   = [];
-        var escalasAtualizadas  = false;
-        var alertCfgAtualizado  = false;
-
-        ['ft_registros', 'ft_colaboradores', 'ft_postos', 'ft_bico_fixo',
-         'ft_horarios_custom'].forEach(function (key) {
-          if (data[key] !== undefined) {
-            try { localStorage.setItem(key, JSON.stringify(data[key])); } catch (e) {}
-            if (window.FT_Store) FT_Store.set(key, data[key]);
-            chavesAtualizadas.push(key);
-          }
-        });
-
-        // ── ft_escalas_custom: aplica o valor remoto SOMENTE se o timestamp
-        //    de gravação remoto não for mais antigo que a última edição feita
-        //    neste dispositivo. O timestamp fica salvo em localStorage (não
-        //    em memória), então sobrevive a um reload da página — é isso que
-        //    impede que uma edição feita pouco antes de recarregar a página
-        //    seja revertida por um snapshot do Firestore que ainda não tinha
-        //    recebido a gravação no momento em que a página recarregou.
-        if (data['ft_escalas_custom'] !== undefined) {
-          var remoteTsEsc = parseInt(data['ft_escalas_custom_ts'] || 0, 10) || 0;
-          var localTsEsc  = parseInt(localStorage.getItem('ft_escalas_custom_ts') || '0', 10) || 0;
-          if (remoteTsEsc >= localTsEsc) {  // >= aceita mesmo ts (outro dispositivo, mesmo segundo)
-            try { localStorage.setItem('ft_escalas_custom', JSON.stringify(data['ft_escalas_custom'])); } catch (e) {}
-            try { localStorage.setItem('ft_escalas_custom_ts', String(remoteTsEsc)); } catch (e) {}
-            if (window.FT_Store) FT_Store.set('ft_escalas_custom', data['ft_escalas_custom']);
-            chavesAtualizadas.push('ft_escalas_custom');
-            escalasAtualizadas = true;
-          }
-          // Se remoteTsEsc < localTsEsc: nossa edição local é mais nova que o
-          // que está no Firestore agora — ignora este snapshot. A própria
-          // gravação pendente (FT_SyncQueue) vai corrigir o servidor em breve.
-        }
-
-        // Sincroniza ft_alert_config (mesma lógica de timestamp acima)
-        if (data['ft_alert_config'] !== undefined) {
-          var remoteTsCfg = parseInt(data['ft_alert_config_ts'] || 0, 10) || 0;
-          var localTsCfg  = parseInt(localStorage.getItem('ft_alert_config_ts') || '0', 10) || 0;
-          if (remoteTsCfg >= localTsCfg) {  // >= aceita mesmo ts (outro dispositivo, mesmo segundo)
-          var remotoCfg = data['ft_alert_config'];
-          // Sempre aplica: normaliza pela serialização para comparação estável
-          var localRaw  = localStorage.getItem('ft_alert_config') || 'null';
-          var remotoRaw = JSON.stringify(remotoCfg);
-          var localCfg  = null;
-          try { localCfg = JSON.parse(localRaw); } catch(e) {}
-          // Compara postos (principal campo que causa dessincronização)
-          var postosDifere = JSON.stringify((remotoCfg.postos||[]).slice().sort())
-                          !== JSON.stringify(((localCfg||{}).postos||[]).slice().sort());
-          var outroCampo  = JSON.stringify(remotoCfg) !== JSON.stringify(localCfg);
-          if (postosDifere || outroCampo) {
-            window._ftApplyingRemote = true;
-            try { localStorage.setItem('ft_alert_config', remotoRaw); } catch(e) {}
-            window._ftApplyingRemote = false;
-            alertCfgAtualizado = true;
-          }
-          try { localStorage.setItem('ft_alert_config_ts', String(remoteTsCfg)); } catch(e) {}
-          }
-        }
-
-        // Sincroniza ft_ciclo_inicio (timestamp numérico)
-        if (data['ft_ciclo_inicio'] !== undefined) {
-          try { localStorage.setItem('ft_ciclo_inicio', String(data['ft_ciclo_inicio'])); } catch(e) {}
-        }
-
-        // Sincroniza ft_alert_snoozed
-        if (data['ft_alert_snoozed'] !== undefined) {
-          try {
-            if (!data['ft_alert_snoozed']) localStorage.removeItem('ft_alert_snoozed');
-            else localStorage.setItem('ft_alert_snoozed', String(data['ft_alert_snoozed']));
-          } catch(e) {}
-        }
-
-        // Aplica dados remotos na UI (memória + re-render) para todas as chaves recebidas
-        if (chavesAtualizadas.length > 0 && typeof window._ftAplicarDadosRemotos === 'function') {
-          try { window._ftAplicarDadosRemotos(chavesAtualizadas); } catch(e) {}
-        }
-
-        // Recarrega ESCALAS_POSTOS em memória quando escalas ou config chegam do Firestore
-        if (escalasAtualizadas || alertCfgAtualizado) {
-          if (typeof window._ftRecarregarEscalas === 'function') {
-            try { window._ftRecarregarEscalas(); } catch(e) {}
-          }
-          // Re-renderiza TODA a UI de alertas para refletir a config remota
-          if (typeof window._ftAlertRender === 'function') {
-            try { window._ftAlertRender(); } catch(e) {}
-          }
-          if (typeof window.updateHeaderBadge === 'function') {
-            try { window.updateHeaderBadge(); } catch(e) {}
-          }
-        }
-
-        // Reavalia alertas imediatamente quando dados mudam
-        if (chavesAtualizadas.length > 0 || escalasAtualizadas || alertCfgAtualizado) {
-          // Com includeMetadataChanges:true:
-          //   fromCache=true  → dado ainda no cache local (escrita pendente)
-          //   fromCache=false → dado confirmado pelo servidor Firestore
-          // Só dispara alerta quando dado vem do servidor (outro dispositivo OU
-          // confirmação da própria escrita — ambos têm fromCache=false)
-          var fromCache      = !!(doc.metadata && doc.metadata.fromCache);
-          var hasPending     = !!(doc.metadata && doc.metadata.hasPendingWrites);
-          var dadoDoServidor = !fromCache && !hasPending;
-
-          if (dadoDoServidor) {
-            setTimeout(function () {
-              if (typeof window._ftScheduledCheck === 'function') {
-                window._ftScheduledCheck();
-              } else if (typeof window._ftUpdateBadge === 'function') {
-                window._ftUpdateBadge();
-              }
-            }, 400);
-          } else {
-            // Cache local: só atualiza badge sem abrir modal
-            setTimeout(function () {
-              if (typeof window._ftUpdateBadge === 'function') window._ftUpdateBadge();
-            }, 300);
-          }
-        }
-
-        // ft_alert_config já tratado acima junto com ft_escalas_custom
-
-        // Notifica a UI (fromSnapshot=true para não exibir toast)
-        if (typeof window.onSyncComplete === 'function') {
-          window.onSyncComplete(true);
-        }
-      }, function (err) {
-        console.warn('[FirebaseSync] Listener error:', err);
-      });
-
-    window._ftFirebaseConectado = true;
-    console.log('[FirebaseSync] ✅ Conectado ao Firestore:', FIREBASE_CONFIG.projectId);
-
-    // ── Funções de gravação direta (bypassa a fila, garante persistência) ──
-    window._ftSalvarEscalaFirebase = function(custom, ts) {
-      try {
-        var col = window.FIRESTORE_COLLECTION || 'folga_trabalhada';
-        var did = window.FIRESTORE_DOC_ID     || 'dados';
-        db.collection(col).doc(did)
-          .set({ ft_escalas_custom: custom, ft_escalas_custom_ts: ts || Date.now() }, { merge: true })
-          .then(function() {
-            console.log('[EscalaSync] ✅ Escala salva no Firebase');
-            if (typeof window.showToast === 'function') window.showToast('☁️ Escala salva no Firebase!', 'success');
-          })
-          .catch(function(e) { console.warn('[EscalaSync] Erro:', e); });
-      } catch(e) { console.warn('[EscalaSync] Erro direto:', e); }
+        .set(payload, { merge: true })
+        .then(function () { console.log('[FB] Escala salva'); })
+        .catch(function(e) { console.warn('[FB] Escala erro:', e); });
     };
 
     window._ftSalvarAlertConfigFirebase = function(cfg, ts) {
-      try {
-        var col = window.FIRESTORE_COLLECTION || 'folga_trabalhada';
-        var did = window.FIRESTORE_DOC_ID     || 'dados';
-        db.collection(col).doc(did)
-          .set({ ft_alert_config: cfg, ft_alert_config_ts: ts || Date.now() }, { merge: true })
-          .then(function() { console.log('[AlertConfigSync] ✅ Config salva no Firebase'); })
-          .catch(function(e) { console.warn('[AlertConfigSync] Erro:', e); });
-      } catch(e) { console.warn('[AlertConfigSync] Erro direto:', e); }
+      var payload = { ft_alert_config: cfg };
+      if (ts) payload['ft_alert_config_ts'] = ts;
+      db.collection(FIRESTORE_COLLECTION)
+        .doc(FIRESTORE_DOC_ID)
+        .set(payload, { merge: true })
+        .then(function () { console.log('[FB] AlertConfig salva'); })
+        .catch(function(e) { console.warn('[FB] AlertConfig erro:', e); });
     };
 
-    // Disponibiliza também como função global de sync forçado da escala atual
+    // ── Função de sync forçado de escala ─────────────────────
     window._ftForceSyncEscala = function() {
       try {
         var custom = JSON.parse(localStorage.getItem('ft_escalas_custom') || '{}');
-        var ts     = parseInt(localStorage.getItem('ft_escalas_custom_ts') || '0') || Date.now();
+        var ts     = getLocalTs('ft_escalas_custom') || Date.now();
         window._ftSalvarEscalaFirebase(custom, ts);
       } catch(e) {}
     };
+
+    // ── Drena dados que ficaram pendentes antes da conexão ───
+    if (window._ftPending) {
+      var p = window._ftPending;
+      if (p.escala) {
+        window._ftSalvarEscalaFirebase(p.escala.data, p.escala.ts);
+      }
+      if (p.alertCfg) {
+        window._ftSalvarAlertConfigFirebase(p.alertCfg.data, p.alertCfg.ts);
+      }
+      window._ftPending = {};
+    }
+
+    // ── Cria o listener em tempo real ────────────────────────
+    criarListener(db);
+
+    // ── Expõe db globalmente para snooze e outros módulos ────
+    window.firebaseDB = db;
+    window._ftFirebaseConectado = true;
+    console.log('[FB] Conectado:', FIREBASE_CONFIG.projectId);
   }
 
-  // ── Permite forçar uma (re)conexão real, usada pelo botão de Diagnóstico
-  //    quando o SDK ainda não carregou ou o listener nunca conectou ──
+  // ── Função de reconexão (usada pelo botão de Diagnóstico) ─
   window._ftReconectarFirebase = function () {
-    if (window._ftFirebaseConectado) return; // já conectado, nada a fazer
+    if (window._ftFirebaseConectado) {
+      // Já conectado: apenas recria o listener (pode ter caído)
+      if (_db) criarListener(_db);
+      return;
+    }
     iniciarCarregamento();
   };
 
+  // ── Carregamento encadeado dos SDKs ──────────────────────
   function iniciarCarregamento() {
-    // Carrega SDKs do Firebase em sequência e inicializa.
-    // CRÍTICO: initFirebase() (que liga o listener onSnapshot em tempo real)
-    // NÃO depende mais do SDK de Messaging. Antes, a cadeia era:
-    //   app-compat → firestore-compat → messaging-compat → initFirebase()
-    // Se o script de Messaging falhasse ao carregar (comum: bloqueado por
-    // ad-blocker/uBlock/Brave, que tratam "firebase-messaging" como rastreador),
-    // o callback nunca disparava e initFirebase() NUNCA era chamado — ou seja,
-    // o listener em tempo real nunca era criado e a sincronização automática
-    // entre dispositivos simplesmente não existia, em silêncio, sem nenhum
-    // erro visível (o botão de Diagnóstico funcionava porque chama
-    // firebase.firestore() direto, sem depender dessa cadeia).
-    // Agora Messaging carrega em paralelo, de forma best-effort, e nunca
-    // bloqueia a conexão real ao Firestore.
     loadScript('https://www.gstatic.com/firebasejs/9.22.2/firebase-app-compat.js', function () {
       loadScript('https://www.gstatic.com/firebasejs/9.22.2/firebase-firestore-compat.js', function () {
         initFirebase();
-        // Messaging (push) é opcional — carrega em paralelo, sem travar o sync
+        // Messaging é opcional — carrega em paralelo, não bloqueia sync
         loadScript('https://www.gstatic.com/firebasejs/9.22.2/firebase-messaging-compat.js', function () {
           if (typeof window._ftMessagingReady === 'function') window._ftMessagingReady();
         });
@@ -7485,9 +7442,20 @@ window._ftSalvarAlertConfigFirebase = function(cfg, ts) {
   }
 
   iniciarCarregamento();
+
+  // ── Reconecta automaticamente ao voltar online ───────────
+  window.addEventListener('online', function () {
+    console.log('[FB] Online — reconectando listener...');
+    setTimeout(function () {
+      if (_db) criarListener(_db);
+      if (window.SyncEngine) SyncEngine.flush();
+    }, 1000);
+  });
+
 }());
 
 </script>
+
 
 <!-- ════════════════════════════════════════════════════════
      MÓDULO FCM — Push Notifications
@@ -9317,11 +9285,15 @@ window._ftSalvarAlertConfigFirebase = function(cfg, ts) {
       btn.style.cssText = 'border:none;background:rgba(139,151,176,.1);color:#8b97b0;border-radius:7px;padding:3px 7px;font-size:.78rem;font-weight:700;cursor:pointer;';
       btn.textContent = '\u2715';
       btn.title = 'Remover posto monitorado';
-      btn.onclick = function() {
-        cfg.postos.splice(idx, 1); saveConfig(cfg);
-        renderBicoPostosMonitorados(); renderConfigPostos(); renderCadAlertasPostos(); updateHeaderBadge();
-        if (typeof window.showToast === 'function') window.showToast('\uD83D\uDDD1\uFE0F Posto removido dos monitorados.', 'error');
-      };
+      (function(postoNome) {
+        btn.onclick = function() {
+          var cfgAtual = loadConfig();
+          cfgAtual.postos = cfgAtual.postos.filter(function(p) { return p !== postoNome; });
+          saveConfig(cfgAtual);
+          renderBicoPostosMonitorados(); renderConfigPostos(); renderCadAlertasPostos(); updateHeaderBadge();
+          if (typeof window.showToast === 'function') window.showToast('\uD83D\uDDD1\uFE0F Posto removido dos monitorados.', 'error');
+        };
+      })(posto);
 
       // Linha 1: dot + nome + ☀️ 🌙 + ativo + ✕
       var linha1 = document.createElement('div');
@@ -9490,12 +9462,16 @@ window._ftSalvarAlertConfigFirebase = function(cfg, ts) {
         btn.style.cssText = 'border:none;background:rgba(139,151,176,.1);color:#8b97b0;border-radius:7px;padding:3px 7px;font-size:.78rem;font-weight:700;cursor:pointer;';
         btn.textContent = '\u2715';
         btn.title = 'Remover posto monitorado';
-        btn.onclick = function() {
-          cfg.postos.splice(idx, 1); saveConfig(cfg);
-          renderCadAlertasPostos(); renderCadAlertasToggles();
-          renderBicoPostosMonitorados(); renderConfigPostos(); updateHeaderBadge();
-          if (typeof window.showToast === 'function') window.showToast('\uD83D\uDDD1\uFE0F Posto removido dos monitorados.', 'error');
-        };
+        (function(postoNome) {
+          btn.onclick = function() {
+            var cfgAtual = loadConfig();
+            cfgAtual.postos = cfgAtual.postos.filter(function(p) { return p !== postoNome; });
+            saveConfig(cfgAtual);
+            renderCadAlertasPostos(); renderCadAlertasToggles();
+            renderBicoPostosMonitorados(); renderConfigPostos(); updateHeaderBadge();
+            if (typeof window.showToast === 'function') window.showToast('\uD83D\uDDD1\uFE0F Posto removido dos monitorados.', 'error');
+          };
+        })(posto);
 
         // Linha 1: dot + nome + ☀️ 🌙 + ativo + ✕
         var linha1 = document.createElement('div');
