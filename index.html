@@ -3229,19 +3229,50 @@
           return;
         }
 
-        // Processa entradas em série
-        return entries.reduce(function(chain, entry) {
-          return chain.then(function() {
-            // Se não há handler remoto, apenas remove da fila (modo local)
-            var handler = self._remoteHandler
-              ? self._remoteHandler(entry)
-              : Promise.resolve(true);
+        // FIX: cada entrada 'set' grava o ESTADO COMPLETO daquele campo
+        // (não um delta) — então se houver mais de uma entrada pendente
+        // para o mesmo "store" (ex.: várias edições de escala enfileiradas
+        // antes de a rede voltar), só a ÚLTIMA importa: as anteriores já
+        // estão contidas nela, e enviá-las depois só correria o risco de
+        // uma gravação mais antiga (com dado incompleto) pousar no servidor
+        // DEPOIS de uma mais nova, revertendo silenciosamente a edição mais
+        // recente. Descarta as duplicatas antigas da fila sem enviá-las.
+        var porStore = {};
+        entries.forEach(function(entry) {
+          if (entry.op !== 'set') return; // só faz sentido coalescer sobrescritas completas
+          if (!porStore[entry.store] || entry.qid > porStore[entry.store].qid) {
+            porStore[entry.store] = entry;
+          }
+        });
+        var qidsMaisRecentes = {};
+        for (var s in porStore) { qidsMaisRecentes[porStore[s].qid] = true; }
+        var obsoletas = entries.filter(function(entry) {
+          return entry.op === 'set' && !qidsMaisRecentes[entry.qid];
+        });
+        var descartar = obsoletas.length
+          ? obsoletas.reduce(function(chain, entry) {
+              return chain.then(function() { return FT_SyncQueue.remove(entry.qid); });
+            }, Promise.resolve())
+          : Promise.resolve();
+        var qidsObsoletos = {};
+        obsoletas.forEach(function(entry) { qidsObsoletos[entry.qid] = true; });
+        entries = entries.filter(function(entry) { return !qidsObsoletos[entry.qid]; });
 
-            return handler.then(function(ok) {
-              if (ok !== false) return FT_SyncQueue.remove(entry.qid);
-            }).catch(function() { /* mantém na fila se falhar */ });
-          });
-        }, Promise.resolve());
+        // Processa entradas em série
+        return descartar.then(function() {
+          return entries.reduce(function(chain, entry) {
+            return chain.then(function() {
+              // Se não há handler remoto, apenas remove da fila (modo local)
+              var handler = self._remoteHandler
+                ? self._remoteHandler(entry)
+                : Promise.resolve(true);
+
+              return handler.then(function(ok) {
+                if (ok !== false) return FT_SyncQueue.remove(entry.qid);
+              }).catch(function() { /* mantém na fila se falhar */ });
+            });
+          }, Promise.resolve());
+        });
       }).then(function() {
         self._syncing = false;
         self.updateStatus(self._online ? 'online' : 'offline');
@@ -8956,7 +8987,26 @@ window._ftFirebaseConectado = false;
           btnSync.style.background = 'linear-gradient(135deg,#45aaf2 0%,#26de81 100%)';
           btnSync.style.boxShadow  = '0 6px 28px rgba(69,170,242,.55),0 2px 8px rgba(0,0,0,.4)';
 
-          window._ftSalvarEscalaFirebase(custom, _ts);
+          // FIX: antes este botão gravava DIRETO no Firestore
+          // (window._ftSalvarEscalaFirebase), por fora da fila (FT_SyncQueue).
+          // Se ainda houvesse gravações antigas pendentes na fila (ex.: rede
+          // instável enquanto o usuário configurava os turnos), elas podiam
+          // ser processadas DEPOIS desta gravação direta e sobrescrever no
+          // servidor o estado completo recém-publicado com um estado antigo
+          // e incompleto — a fila não sabia que uma gravação "furou a fila".
+          // Isso bate exatamente com o sintoma relatado: escala da semana
+          // toda configurada, ao "Publicar" alguns turnos somem em outros
+          // aparelhos. Agora o botão enfileira como qualquer outra edição —
+          // um único caminho de gravação, sempre em ordem.
+          if (window.FT_SyncQueue) {
+            FT_SyncQueue.enqueue('set', '__escalas_payload__',
+              { ft_escalas_custom: custom, ft_escalas_custom_ts: _ts }
+            ).then(function() {
+              if (window.SyncEngine) SyncEngine.flush();
+            });
+          } else {
+            window._ftSalvarEscalaFirebase(custom, _ts);
+          }
 
           setTimeout(function() {
             // Estado: sucesso
