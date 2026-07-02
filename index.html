@@ -8763,8 +8763,19 @@ window._ftFirebaseConectado = false;
     var btnAdd = document.getElementById('ft-escala-btn-add-turno');
     if (btnAdd) {
       btnAdd.addEventListener('click', function() {
-        if (!_escalaPosToEdit) return;
-        adicionarTurnoEscala(_escalaPosToEdit);
+        if (!_escalaPosToEdit) {
+          if (typeof window.showToast === 'function') window.showToast('⚠️ Nenhum posto selecionado. Toque em "Editar" primeiro.', 'error');
+          return;
+        }
+        // FIX: blinda o clique com try/catch — qualquer falha inesperada
+        // (ex.: Firebase ainda conectando) agora mostra um erro visível
+        // em vez de o botão parecer não fazer nada.
+        try {
+          adicionarTurnoEscala(_escalaPosToEdit);
+        } catch (e) {
+          console.error('[Escala] Erro ao adicionar turno:', e);
+          if (typeof window.showToast === 'function') window.showToast('❌ Erro ao salvar turno: ' + e.message, 'error');
+        }
       });
     }
 
@@ -9195,11 +9206,21 @@ window._ftFirebaseConectado = false;
     };
 
     // _ftRecarregarEscalas: recarrega escalas custom do localStorage para memória
-    window._ftRecarregarEscalas = function() {
-      try { carregarEscalasCustomNaMemoria(); } catch(e) {}
-      try { renderEscalaSelectPostos();       } catch(e) {}
-      try { updateHeaderBadge();              } catch(e) {}
-    };
+    // FIX: encadeia com a versão já definida (não sobrescreve) — antes isso
+    // descartava a re-renderização do editor de escala aberto (_escalaPosToEdit),
+    // fazendo a tela de "Adicionar Turno" parecer travada quando chegava uma
+    // sincronização do Firestore logo após o usuário salvar um turno.
+    (function() {
+      var _ftRecarregarEscalasAnteriorInit = window._ftRecarregarEscalas;
+      window._ftRecarregarEscalas = function() {
+        if (typeof _ftRecarregarEscalasAnteriorInit === 'function') {
+          try { _ftRecarregarEscalasAnteriorInit(); } catch(e) {}
+        }
+        try { carregarEscalasCustomNaMemoria(); } catch(e) {}
+        try { renderEscalaSelectPostos();       } catch(e) {}
+        try { updateHeaderBadge();              } catch(e) {}
+      };
+    }());
 
     // Revalida quando a aba volta ao foco (usuário troca de app e volta)
     document.addEventListener('visibilitychange', function () {
