@@ -7138,6 +7138,24 @@ var FIREBASE_CONFIG = {
 var FIRESTORE_COLLECTION = 'folga_trabalhada';
 var FIRESTORE_DOC_ID     = 'dados';
 
+// ── FIX: Firestore não aceita array-dentro-de-array (nested arrays).
+// A estrutura de ft_escalas_custom é { posto: { semana: [ [turnos...], [turnos...], ... ] } }
+// — "semana" é um array de 7 arrays, o que o Firestore rejeita com o erro
+// "Nested arrays are not supported". Por isso o botão de salvar turno
+// nunca conseguia gravar de verdade na nuvem (falhava silenciosamente,
+// só logando no console.warn). A correção: serializar o mapa inteiro
+// como JSON (string) antes de enviar, e desserializar ao receber.
+function _ftSerializeEscalas(custom) {
+  try { return JSON.stringify(custom || {}); } catch (e) { return '{}'; }
+}
+function _ftDeserializeEscalas(val) {
+  if (typeof val === 'string') {
+    try { return JSON.parse(val); } catch (e) { return {}; }
+  }
+  if (val && typeof val === 'object') return val; // compat: dado antigo já gravado como objeto
+  return {};
+}
+
 // ── Stubs: evitam "is not a function" antes do Firebase conectar ──
 // Quando chamados antes da conexão, guardam o dado para envio posterior.
 window._ftSalvarEscalaFirebase = function(custom, ts) {
@@ -7246,7 +7264,8 @@ window._ftFirebaseConectado = false;
         // dispositivo também editou (o mais recente vence).
         if (data['ft_escalas_custom'] !== undefined) {
           var tsEscRemoto = parseInt(data['ft_escalas_custom_ts'] || 0, 10) || 0;
-          if (aplicarSeNovo('ft_escalas_custom', data['ft_escalas_custom'], tsEscRemoto)) {
+          var escalasRemotoObj = _ftDeserializeEscalas(data['ft_escalas_custom']);
+          if (aplicarSeNovo('ft_escalas_custom', escalasRemotoObj, tsEscRemoto)) {
             if (dadoServidor) chavesUI.push('ft_escalas_custom');
             // Recarrega ESCALAS_POSTOS em memória com os novos dados
             if (typeof window._ftRecarregarEscalas === 'function') {
@@ -7369,7 +7388,7 @@ window._ftFirebaseConectado = false;
 
     // ── Implementações reais das funções de gravação ──────────
     window._ftSalvarEscalaFirebase = function(custom, ts) {
-      var payload = { ft_escalas_custom: custom };
+      var payload = { ft_escalas_custom: _ftSerializeEscalas(custom) };
       if (ts) payload['ft_escalas_custom_ts'] = ts;
       db.collection(FIRESTORE_COLLECTION)
         .doc(FIRESTORE_DOC_ID)
@@ -8685,7 +8704,7 @@ window._ftFirebaseConectado = false;
     // ── Enfileira também na fila (fallback/offline) ──────────────────
     if (window.FT_SyncQueue) {
       FT_SyncQueue.enqueue('set', '__escalas_payload__',
-        { ft_escalas_custom: custom, ft_escalas_custom_ts: _ts }
+        { ft_escalas_custom: _ftSerializeEscalas(custom), ft_escalas_custom_ts: _ts }
       ).then(function() {
         if (window.SyncEngine) SyncEngine.flush();
       });
@@ -8869,7 +8888,7 @@ window._ftFirebaseConectado = false;
         window._ftSalvarEscalaFirebase(custom, _tsLimpar);
         if (window.FT_SyncQueue) {
           FT_SyncQueue.enqueue('set', '__escalas_payload__',
-            { ft_escalas_custom: custom, ft_escalas_custom_ts: _tsLimpar }
+            { ft_escalas_custom: _ftSerializeEscalas(custom), ft_escalas_custom_ts: _tsLimpar }
           ).then(function() {
             if (window.SyncEngine) SyncEngine.flush();
           });
@@ -9888,9 +9907,9 @@ window.diagSync = function () {
 
       // ── Mescla escalas customizadas ──
       var escLocal  = lerLocal(MAPA, true);
-      var escRemoto = (data[MAPA] && typeof data[MAPA] === 'object') ? data[MAPA] : {};
+      var escRemoto = _ftDeserializeEscalas(data[MAPA]);
       var escMesclado = mergeEscalasCustom(escLocal, escRemoto);
-      upd[MAPA] = escMesclado;
+      upd[MAPA] = _ftSerializeEscalas(escMesclado);
       gravarLocal(MAPA, escMesclado);
       line('🔀 ' + MAPA + ': ' + Object.keys(escMesclado).length + ' posto(s) com escala customizada', '#26de81');
 
