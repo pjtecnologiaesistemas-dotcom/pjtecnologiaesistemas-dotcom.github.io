@@ -7173,27 +7173,14 @@ var FIRESTORE_DOC_ID     = 'dados';
       SyncEngine.flush();
     }
 
-    // ── Bridge de escrita: usada como FALLBACK (quando a fila IndexedDB não
-    //    está disponível) e para reenviar o que ficou pendente de antes do
-    //    Firebase conectar. Não é mais o caminho principal — ver saveConfig().
+    // ── Bridge de escrita: saveConfig chama esta função após Firebase conectar ──
     window._ftAlertConfigSync = function (cfg) {
       var upd = { ft_alert_config: cfg };
-      // Inclui o timestamp da edição (salvo em localStorage por saveConfig)
-      // para que o listener onSnapshot, em qualquer dispositivo, saiba se
-      // este dado é mais novo que o que ele já tem antes de aplicá-lo.
+      // Grava ft_escalas_custom junto para manter consistência entre dispositivos
       try {
-        var tsCfg = parseInt(localStorage.getItem('ft_alert_config_ts') || '0', 10);
-        if (tsCfg) upd['ft_alert_config_ts'] = tsCfg;
+        var esc = JSON.parse(localStorage.getItem('ft_escalas_custom') || '{}');
+        if (Object.keys(esc).length > 0) upd['ft_escalas_custom'] = esc;
       } catch(e) {}
-      // BUG CORRIGIDO: esta função gravava também o ft_escalas_custom atual
-      // junto com a config, em PARALELO com a gravação própria das escalas
-      // (em salvarEscalaCustom). Como são duas gravações assíncronas
-      // independentes sem ordem garantida, salvar uma config (ex.: ativar/
-      // desativar alerta, adicionar um posto) podia chegar ao Firestore
-      // DEPOIS de um turno recém-adicionado e sobrescrevê-lo com um valor
-      // de escala mais antigo — o turno "desaparecia" para os outros
-      // dispositivos. As escalas agora têm seu próprio caminho exclusivo de
-      // sincronização (a fila), então não são mais duplicadas aqui.
       db.collection(FIRESTORE_COLLECTION)
         .doc(FIRESTORE_DOC_ID)
         .set(upd, { merge: true })
@@ -7211,16 +7198,12 @@ var FIRESTORE_DOC_ID     = 'dados';
       try {
         var col = FIRESTORE_COLLECTION || 'folga_trabalhada';
         var did = FIRESTORE_DOC_ID     || 'dados';
-        var updEsc = { ft_escalas_custom: window._ftEscalaCustomPending };
-        if (window._ftEscalaCustomPendingTs) updEsc['ft_escalas_custom_ts'] = window._ftEscalaCustomPendingTs;
         db.collection(col).doc(did)
-          .set(updEsc, { merge: true })
+          .set({ ft_escalas_custom: window._ftEscalaCustomPending }, { merge: true })
           .catch(function(e){ console.warn('[EscalaSync pending]', e); });
         window._ftEscalaCustomPending = null;
-        window._ftEscalaCustomPendingTs = null;
       } catch(e) {}
     }
-
 
     // ── Listener em tempo real (recebe mudanças de outros dispositivos) ──
     db.collection(FIRESTORE_COLLECTION)
@@ -7235,41 +7218,17 @@ var FIRESTORE_DOC_ID     = 'dados';
         var alertCfgAtualizado  = false;
 
         ['ft_registros', 'ft_colaboradores', 'ft_postos', 'ft_bico_fixo',
-         'ft_horarios_custom'].forEach(function (key) {
+         'ft_horarios_custom', 'ft_escalas_custom'].forEach(function (key) {
           if (data[key] !== undefined) {
             try { localStorage.setItem(key, JSON.stringify(data[key])); } catch (e) {}
             if (window.FT_Store) FT_Store.set(key, data[key]);
             chavesAtualizadas.push(key);
+            if (key === 'ft_escalas_custom') escalasAtualizadas = true;
           }
         });
 
-        // ── ft_escalas_custom: aplica o valor remoto SOMENTE se o timestamp
-        //    de gravação remoto não for mais antigo que a última edição feita
-        //    neste dispositivo. O timestamp fica salvo em localStorage (não
-        //    em memória), então sobrevive a um reload da página — é isso que
-        //    impede que uma edição feita pouco antes de recarregar a página
-        //    seja revertida por um snapshot do Firestore que ainda não tinha
-        //    recebido a gravação no momento em que a página recarregou.
-        if (data['ft_escalas_custom'] !== undefined) {
-          var remoteTsEsc = parseInt(data['ft_escalas_custom_ts'] || 0, 10) || 0;
-          var localTsEsc  = parseInt(localStorage.getItem('ft_escalas_custom_ts') || '0', 10) || 0;
-          if (remoteTsEsc >= localTsEsc) {
-            try { localStorage.setItem('ft_escalas_custom', JSON.stringify(data['ft_escalas_custom'])); } catch (e) {}
-            try { localStorage.setItem('ft_escalas_custom_ts', String(remoteTsEsc)); } catch (e) {}
-            if (window.FT_Store) FT_Store.set('ft_escalas_custom', data['ft_escalas_custom']);
-            chavesAtualizadas.push('ft_escalas_custom');
-            escalasAtualizadas = true;
-          }
-          // Se remoteTsEsc < localTsEsc: nossa edição local é mais nova que o
-          // que está no Firestore agora — ignora este snapshot. A própria
-          // gravação pendente (FT_SyncQueue) vai corrigir o servidor em breve.
-        }
-
-        // Sincroniza ft_alert_config (mesma lógica de timestamp acima)
+        // Sincroniza ft_alert_config
         if (data['ft_alert_config'] !== undefined) {
-          var remoteTsCfg = parseInt(data['ft_alert_config_ts'] || 0, 10) || 0;
-          var localTsCfg  = parseInt(localStorage.getItem('ft_alert_config_ts') || '0', 10) || 0;
-          if (remoteTsCfg >= localTsCfg) {
           var remotoCfg = data['ft_alert_config'];
           // Sempre aplica: normaliza pela serialização para comparação estável
           var localRaw  = localStorage.getItem('ft_alert_config') || 'null';
@@ -7285,8 +7244,6 @@ var FIRESTORE_DOC_ID     = 'dados';
             try { localStorage.setItem('ft_alert_config', remotoRaw); } catch(e) {}
             window._ftApplyingRemote = false;
             alertCfgAtualizado = true;
-          }
-          try { localStorage.setItem('ft_alert_config_ts', String(remoteTsCfg)); } catch(e) {}
           }
         }
 
@@ -7945,33 +7902,22 @@ var FIRESTORE_DOC_ID     = 'dados';
     try { localStorage.setItem(LS_CONFIG, JSON.stringify(cfg)); } catch (e) {}
     // Envia ao Firestore apenas quando mudança veio do usuário (não de snapshot remoto)
     if (!window._ftApplyingRemote) {
-      // ── Timestamp da edição: salvo em localStorage (sobrevive a reload).
-      //    É comparado pelo listener onSnapshot para decidir se um dado
-      //    remoto pode sobrescrever esta edição local ou não.
-      var _tsCfg = Date.now();
-      try { localStorage.setItem('ft_alert_config_ts', String(_tsCfg)); } catch (e) {}
-      // ── Sincroniza com Firestore SOMENTE através da fila (FT_SyncQueue) ──
-      //    BUG CORRIGIDO: antes a gravação direta (via _ftAlertConfigSync)
-      //    rodava em PARALELO com a fila, e ainda incluía por "segurança" o
-      //    valor atual de ft_escalas_custom. Como duas escritas assíncronas
-      //    independentes não chegam ao Firestore em ordem garantida, salvar
-      //    uma config (ativar/desativar alerta, adicionar/remover posto)
-      //    podia sobrescrever no servidor um turno recém-adicionado em
-      //    outra ação, com um valor de escala mais antigo. A fila grava em
-      //    ordem, um item por vez — elimina essa corrida.
+      if (typeof window._ftAlertConfigSync === 'function') {
+        try { window._ftAlertConfigSync(cfg); } catch (e) {}
+      } else {
+        // Firebase ainda não conectou — guarda para enviar assim que conectar
+        window._ftAlertConfigPending = cfg;
+      }
+      // Reforço de durabilidade: também enfileira no IndexedDB (mesma fila usada
+      // por colaboradores/postos/registros). Diferente da variável "_ftAlertConfigPending"
+      // (perdida se a aba fechar antes de reconectar), a fila persiste e é
+      // reenviada automaticamente no próximo flush/abertura do app — corrige
+      // o caso de a config de alertas ficar "presa" sem sincronizar quando
+      // salva sem conexão.
       if (window.FT_SyncQueue) {
         FT_SyncQueue.enqueue('set', LS_CONFIG, cfg).then(function() {
           if (window.SyncEngine) SyncEngine.flush();
         });
-        FT_SyncQueue.enqueue('set', 'ft_alert_config_ts', _tsCfg).then(function() {
-          if (window.SyncEngine) SyncEngine.flush();
-        });
-      } else if (typeof window._ftAlertConfigSync === 'function') {
-        // Fallback: só usado se a fila IndexedDB estiver indisponível neste navegador
-        try { window._ftAlertConfigSync(cfg); } catch (e) {}
-      } else {
-        // Nem fila nem Firebase disponíveis ainda — guarda para enviar assim que conectar
-        window._ftAlertConfigPending = cfg;
       }
     }
   }
@@ -8534,33 +8480,11 @@ var FIRESTORE_DOC_ID     = 'dados';
     saveEscalasCustom(custom);
     // Atualiza ESCALAS_POSTOS em memória
     ESCALAS_POSTOS[postoNome] = { semana: semana };
-    // ── Timestamp da edição: salvo em localStorage (sobrevive a reload).
-    //    É comparado pelo listener onSnapshot para decidir se um dado
-    //    remoto pode sobrescrever esta edição local ou não.
-    var _ts = Date.now();
-    try { localStorage.setItem('ft_escalas_custom_ts', String(_ts)); } catch(e) {}
-    // ── Sincroniza com Firestore SOMENTE através da fila (FT_SyncQueue) ──
-    //    BUG CORRIGIDO: antes havia também uma gravação DIRETA aqui, em
-    //    paralelo com a fila, para "garantir" o envio mais rápido. Na
-    //    prática isso criava uma condição de corrida — ao adicionar dois
-    //    turnos em sequência rápida (ex.: dois dias diferentes, um atrás do
-    //    outro), a gravação direta do 1º turno podia terminar DEPOIS da
-    //    gravação do 2º (direta ou pela fila), e o valor mais antigo
-    //    "vencia" no Firestore, fazendo o turno recém-adicionado desaparecer
-    //    nos outros dispositivos (ou depois de limpar o app/recarregar sem
-    //    cache local). A fila processa as gravações em ORDEM, uma de cada
-    //    vez, o que elimina essa corrida.
-    if (window.FT_SyncQueue) {
-      FT_SyncQueue.enqueue('set', 'ft_escalas_custom', custom).then(function() {
-        if (window.SyncEngine) SyncEngine.flush();
-      });
-      FT_SyncQueue.enqueue('set', 'ft_escalas_custom_ts', _ts).then(function() {
-        if (window.SyncEngine) SyncEngine.flush();
-      });
-    } else if (typeof window._ftAlertConfigSync === 'function') {
-      // Fallback: só usado se a fila IndexedDB estiver indisponível neste navegador
+    // Sincroniza ft_escalas_custom com Firestore para outros dispositivos
+    if (typeof window._ftAlertConfigSync === 'function') {
+      // Reutiliza a bridge para gravar ft_escalas_custom junto
       try {
-        var upd = { ft_escalas_custom: custom, ft_escalas_custom_ts: _ts };
+        var upd = { ft_escalas_custom: custom };
         var col = window.FIRESTORE_COLLECTION || 'folga_trabalhada';
         var did = window.FIRESTORE_DOC_ID     || 'dados';
         if (typeof firebase !== 'undefined') {
@@ -8570,9 +8494,16 @@ var FIRESTORE_DOC_ID     = 'dados';
         }
       } catch(e) {}
     } else {
-      // Nem fila nem Firebase disponíveis ainda — guarda para envio posterior
-      window._ftEscalaCustomPending = custom;
-      window._ftEscalaCustomPendingTs = _ts;
+      // Firebase ainda não conectou — enfileira para envio posterior
+      window._ftEscalaCustomPending = loadEscalasCustom();
+    }
+    // Reforço de durabilidade (mesma fila do IndexedDB usada para os demais
+    // dados): garante reenvio automático mesmo se a aba fechar offline antes
+    // do envio direto acima ser concluído.
+    if (window.FT_SyncQueue) {
+      FT_SyncQueue.enqueue('set', 'ft_escalas_custom', custom).then(function() {
+        if (window.SyncEngine) SyncEngine.flush();
+      });
     }
   }
 
@@ -8653,18 +8584,6 @@ var FIRESTORE_DOC_ID     = 'dados';
         // Remove do ESCALAS_POSTOS em memória também
         delete ESCALAS_POSTOS[_escalaPosToEdit];
         saveEscalasCustom(custom);
-        // Sincroniza a remoção com os outros dispositivos (mesma fila usada
-        // em salvarEscalaCustom — sem isso a remoção ficava só neste aparelho).
-        var _tsLimpar = Date.now();
-        try { localStorage.setItem('ft_escalas_custom_ts', String(_tsLimpar)); } catch(e) {}
-        if (window.FT_SyncQueue) {
-          FT_SyncQueue.enqueue('set', 'ft_escalas_custom', custom).then(function() {
-            if (window.SyncEngine) SyncEngine.flush();
-          });
-          FT_SyncQueue.enqueue('set', 'ft_escalas_custom_ts', _tsLimpar).then(function() {
-            if (window.SyncEngine) SyncEngine.flush();
-          });
-        }
         renderEscalaDiasList(_escalaPosToEdit);
         updateHeaderBadge();
         if (typeof window.showToast === 'function') window.showToast('🗑️ Escala removida.', 'success');
@@ -8672,35 +8591,16 @@ var FIRESTORE_DOC_ID     = 'dados';
     }
   }
 
-  // Carrega escalas customizadas do localStorage e injeta no ESCALAS_POSTOS.
-  // IMPORTANTE: esta função é chamada repetidamente (toda vez que chega uma
-  // sincronização do Firestore, via _ftRecarregarEscalas) — por isso ela
-  // SÓ recarrega dados, sem nenhum efeito colateral de gravação. A migração
-  // de postos sem escala (que grava no Firestore) foi separada para
-  // migrarPostosSemEscalaUmaVez(), chamada uma única vez no init().
+  // Carrega escalas customizadas do localStorage e injeta no ESCALAS_POSTOS ao iniciar
   function carregarEscalasCustomNaMemoria() {
     var custom = loadEscalasCustom();
     for (var posto in custom) {
       ESCALAS_POSTOS[posto] = { semana: custom[posto] };
     }
-  }
 
-  /* ── Migração: postos monitorados sem escala ganham escala padrão 24h ──
-     Garante que postos adicionados manualmente em versões anteriores
-     (antes da correção) também passem a gerar alertas.
-     ⚠️ Executa GRAVAÇÃO (salvarEscalaCustom) — por isso só pode rodar
-     UMA VEZ por carregamento real da página, nunca em resposta a um
-     snapshot remoto. Rodar isso a cada sincronização era exatamente o que
-     fazia uma edição de escala "voltar" para o padrão 18:00→06:00: um
-     snapshot do Firestore um pouco desatualizado chegava, a chamada
-     reativa de _ftRecarregarEscalas() rodava esta migração de novo, via
-     ESCALAS_POSTOS momentaneamente sem o posto, recriava a escala padrão
-     — e gravava esse padrão de volta no Firestore com um timestamp NOVO,
-     "confirmando" o valor errado como se fosse a edição mais recente. ── */
-  var _ftMigracaoEscalaJaExecutada = false;
-  function migrarPostosSemEscalaUmaVez() {
-    if (_ftMigracaoEscalaJaExecutada) return;
-    _ftMigracaoEscalaJaExecutada = true;
+    /* ── Migração: postos monitorados sem escala ganham escala padrão 24h ──
+       Garante que postos adicionados manualmente em versões anteriores
+       (antes da correção) também passem a gerar alertas. ────────────────── */
     var cfgMig = loadConfig();
     cfgMig.postos.forEach(function(posto) {
       var normP = norm(posto);
@@ -8839,7 +8739,6 @@ var FIRESTORE_DOC_ID     = 'dados';
   /* ── Inicialização ─────────────────────────────────────── */
   function init() {
     carregarEscalasCustomNaMemoria(); // injeta escalas salvas antes de tudo
-    migrarPostosSemEscalaUmaVez();    // roda só aqui, uma vez por carregamento da página
     // Garante config local SEM publicar no Firestore (evita sobrescrever config de outros dispositivos)
     (function() {
       try {
