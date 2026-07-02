@@ -8618,7 +8618,12 @@ window._ftFirebaseConectado = false;
           btnDel.dataset.dia = diaIdx;
           btnDel.dataset.idx = tIdx;
           btnDel.addEventListener('click', function() {
-            deletarTurnoEscala(postoNome, parseInt(this.dataset.dia), parseInt(this.dataset.idx));
+            try {
+              deletarTurnoEscala(postoNome, parseInt(this.dataset.dia), parseInt(this.dataset.idx));
+            } catch (e) {
+              console.error('[Escala] Erro ao remover turno:', e);
+              if (typeof window.showToast === 'function') window.showToast('❌ Erro ao remover turno: ' + e.message, 'error');
+            }
           });
 
           chip.appendChild(label);
@@ -8716,6 +8721,17 @@ window._ftFirebaseConectado = false;
 
     var nd = sMin <= eMin; // saída <= entrada → passa da meia-noite
     var semana = getEscalaSemanaEditavel(postoNome);
+
+    // FIX: impede turnos idênticos duplicados no mesmo dia (evita o
+    // "cliquei várias vezes achando que não funcionou" empilhar turnos repetidos).
+    var jaExiste = (semana[diaIdx] || []).some(function(t) {
+      return t.e === eMin && t.s === sMin && t.per === periodo;
+    });
+    if (jaExiste) {
+      if (typeof window.showToast === 'function') window.showToast('⚠️ Esse turno já existe nesse dia.', 'error');
+      return;
+    }
+
     semana[diaIdx].push({ e: eMin, s: sMin, nd: nd, per: periodo });
     salvarEscalaCustom(postoNome, semana);
 
@@ -8724,6 +8740,21 @@ window._ftFirebaseConectado = false;
     renderEscalaDiasList(postoNome);
     updateHeaderBadge();
     if (typeof window.showToast === 'function') window.showToast('✅ Turno adicionado!', 'success');
+
+    // FIX: rola até o dia alterado e pisca a borda, para dar feedback visual
+    // claro de que o turno foi salvo (antes não havia nenhuma pista visual
+    // além do toast, que podia passar despercebido no celular).
+    setTimeout(function() {
+      var diasEl = document.getElementById('ft-escala-dias-list');
+      if (!diasEl) return;
+      var rowDia = diasEl.children[diaIdx];
+      if (!rowDia) return;
+      rowDia.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      var corOriginal = rowDia.style.borderColor;
+      rowDia.style.transition = 'border-color .3s';
+      rowDia.style.borderColor = '#26de81';
+      setTimeout(function() { rowDia.style.borderColor = corOriginal; }, 1200);
+    }, 50);
   }
 
   function deletarTurnoEscala(postoNome, diaIdx, turnoIdx) {
