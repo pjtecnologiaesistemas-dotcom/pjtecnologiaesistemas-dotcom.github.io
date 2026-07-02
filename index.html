@@ -14,40 +14,10 @@
 <meta name="apple-mobile-web-app-title" content="FT">
 <script>
   if ('serviceWorker' in navigator) {
-    // ── Auto-reload quando uma versão nova do Service Worker assume o controle ──
-    // BUG: o service-worker.js já tinha skipWaiting()+clients.claim(), então a
-    // versão nova assume o controle pouco depois de um deploy — mas a aba que
-    // já estava aberta continuava executando o JS ANTIGO (já carregado em
-    // memória) indefinidamente, mesmo com o app instalado como PWA e mesmo
-    // depois de corrigido um bug no servidor. Era preciso fechar e reabrir o
-    // app manualmente para realmente receber o código novo. Este listener
-    // recarrega a página UMA vez quando isso acontece, garantindo que o
-    // index.html (e o JS dele) carregado seja sempre o mais recente.
-    var _swRefreshing = false;
-    navigator.serviceWorker.addEventListener('controllerchange', function() {
-      if (_swRefreshing) return;
-      _swRefreshing = true;
-      window.location.reload();
-    });
-
     window.addEventListener('load', function() {
       // Registra o SW principal (PWA + cache)
       navigator.serviceWorker.register('/Novafolgatrabalhada2/service-worker.js')
-        .then(function(reg) {
-          console.log('[SW] Registrado:', reg.scope);
-          // Verifica se há uma versão nova agora, em vez de esperar o
-          // intervalo padrão do navegador (que pode levar até 24h).
-          reg.update().catch(function(){});
-          // Verifica de novo sempre que o app volta a ficar visível — cobre o
-          // caso comum em celular de reabrir o PWA pelos "recentes" sem ele
-          // ter sido encerrado de fato, onde o app fica "parado" numa versão
-          // antiga até alguém forçar uma checagem.
-          document.addEventListener('visibilitychange', function() {
-            if (document.visibilityState === 'visible') {
-              reg.update().catch(function(){});
-            }
-          });
-        })
+        .then(function(reg) { console.log('[SW] Registrado:', reg.scope); })
         .catch(function(err) { console.warn('[SW] Falhou:', err); });
     });
   }
@@ -515,7 +485,7 @@
     font-size: .9rem;
     opacity: 0;
     transition: transform .35s cubic-bezier(.34,1.56,.64,1), opacity .35s;
-    z-index: 10000;
+    z-index: 999;
     white-space: nowrap;
     max-width: 90vw;
     text-align: center;
@@ -7121,11 +7091,8 @@
      ════════════════════════════════════════════════════════ -->
 <script>
 
-// ══════════════════════════════════════════════════════════════
-//  MÓDULO FIREBASE — Sincronização em tempo real
-//  Reescrito do zero para sincronismo confiável de alertas
-// ══════════════════════════════════════════════════════════════
-
+// ── 1. SUAS CREDENCIAIS FIREBASE ──────────────────────────────
+//      Substitua pelos valores do seu projeto
 var FIREBASE_CONFIG = {
   apiKey:            "AIzaSyA6OzNUzlHVJaG3CsnQ3m-cfcuOkf6Ve-Q",
   authDomain:        "nova-folga-trabalhada.firebaseapp.com",
@@ -7135,171 +7102,200 @@ var FIREBASE_CONFIG = {
   appId:             "1:187145497152:web:8f943193dffdadd2340da5"
 };
 
+// ── 2. ID DO DOCUMENTO ÚNICO NO FIRESTORE ────────────────────
+//      Todos os dados ficam em: /folga_trabalhada/dados
 var FIRESTORE_COLLECTION = 'folga_trabalhada';
 var FIRESTORE_DOC_ID     = 'dados';
 
-// ── FIX: Firestore não aceita array-dentro-de-array (nested arrays).
-// A estrutura de ft_escalas_custom é { posto: { semana: [ [turnos...], [turnos...], ... ] } }
-// — "semana" é um array de 7 arrays, o que o Firestore rejeita com o erro
-// "Nested arrays are not supported". Por isso o botão de salvar turno
-// nunca conseguia gravar de verdade na nuvem (falhava silenciosamente,
-// só logando no console.warn). A correção: serializar o mapa inteiro
-// como JSON (string) antes de enviar, e desserializar ao receber.
-function _ftSerializeEscalas(custom) {
-  try { return JSON.stringify(custom || {}); } catch (e) { return '{}'; }
-}
-function _ftDeserializeEscalas(val) {
-  if (typeof val === 'string') {
-    try { return JSON.parse(val); } catch (e) { return {}; }
-  }
-  if (val && typeof val === 'object') return val; // compat: dado antigo já gravado como objeto
-  return {};
-}
-
-// ── Stubs: evitam "is not a function" antes do Firebase conectar ──
-// Quando chamados antes da conexão, guardam o dado para envio posterior.
-window._ftSalvarEscalaFirebase = function(custom, ts) {
-  window._ftPending = window._ftPending || {};
-  window._ftPending.escala   = { data: custom, ts: ts || Date.now() };
-};
-window._ftSalvarAlertConfigFirebase = function(cfg, ts) {
-  window._ftPending = window._ftPending || {};
-  window._ftPending.alertCfg = { data: cfg,    ts: ts || Date.now() };
-};
-window._ftFirebaseConectado = false;
+// ─────────────────────────────────────────────────────────────
 
 (function () {
   'use strict';
 
-  // ── Carrega script via CDN com retry ──────────────────────
-  function loadScript(src, cb, retry) {
+  // Carrega o SDK Firebase via CDN
+  // CRÍTICO: tem onerror + 1 retry — sem isso, uma falha de rede em QUALQUER
+  // script da cadeia (ex.: CDN bloqueado por ad-blocker) travava o
+  // encadeamento para sempre e o app nunca conectava ao Firestore,
+  // mesmo sem nenhum erro visível no console do usuário.
+  function loadScript(src, cb, _isRetry) {
     var s = document.createElement('script');
     s.src = src;
     s.onload = cb;
     s.onerror = function () {
-      if (retry) { console.warn('[FB] Falha definitiva:', src); return; }
-      console.warn('[FB] Retry:', src);
+      if (_isRetry) {
+        console.warn('[FirebaseSync] Falha definitiva ao carregar script:', src);
+        return; // desiste após 1 retry — não bloqueia o resto do app
+      }
+      console.warn('[FirebaseSync] Falha ao carregar script, tentando novamente:', src);
       setTimeout(function () { loadScript(src, cb, true); }, 1500);
     };
     document.head.appendChild(s);
   }
 
-  // ── Referência ao db (usado fora do initFirebase para snooze etc.) ──
-  var _db = null;
-
-  // ── Listener ativo (para poder cancelar e recriar se necessário) ──
-  var _unsubscribe = null;
-
-  // ── Ultima versão local de cada campo sincronizado ──────────
-  // Permite ignorar snapshots que chegam com dados mais antigos
-  // que a edição local mais recente.
-  function getLocalTs(key) {
-    return parseInt(localStorage.getItem(key + '_ts') || '0', 10) || 0;
-  }
-  function setLocalTs(key, ts) {
-    try { localStorage.setItem(key + '_ts', String(ts)); } catch(e) {}
-  }
-
-  // ── Aplica dado remoto no localStorage apenas se for mais novo ──
-  // Retorna true se aplicou (dado era mais novo ou igual do servidor).
-  function aplicarSeNovo(key, valor, tsRemoto) {
-    var tsLocal = getLocalTs(key);
-    // Se não temos timestamp local, sempre aplica
-    if (tsRemoto > 0 && tsLocal > tsRemoto) {
-      // Nossa edição local é mais nova — ignora este snapshot
-      return false;
+  function initFirebase() {
+    // Inicializa app Firebase (evita re-inicialização)
+    var app;
+    try {
+      app = firebase.app();
+    } catch (e) {
+      app = firebase.initializeApp(FIREBASE_CONFIG);
     }
-    try { localStorage.setItem(key, JSON.stringify(valor)); } catch(e) {}
-    if (window.FT_Store) try { FT_Store.set(key, valor); } catch(e) {}
-    if (tsRemoto > 0) setLocalTs(key, tsRemoto);
-    return true;
-  }
 
-  // ── Cria / recria o listener onSnapshot ───────────────────
-  function criarListener(db) {
-    if (_unsubscribe) { try { _unsubscribe(); } catch(e) {} }
+    var db = firebase.firestore();
 
-    _unsubscribe = db
-      .collection(FIRESTORE_COLLECTION)
-      .doc(FIRESTORE_DOC_ID)
-      // includeMetadataChanges=true: recebe notificação quando dado
-      // sai do cache local e é confirmado pelo servidor Firestore.
-      // Sem isso, fromCache nunca transitaria e não saberíamos distinguir
-      // escrita local de dado vindo de outro dispositivo.
-      .onSnapshot({ includeMetadataChanges: true }, function (doc) {
-        if (!doc.exists) return;
+    // ── Handler remoto registrado no SyncEngine ──────────────
+    // Recebe cada entrada da fila e grava no Firestore
+    if (window.SyncEngine) {
+      SyncEngine.setRemote(function (entry) {
+        // entry = { qid, op, store, payload, ts }
+        // Estratégia: sobrescreve o campo correspondente no documento único
+        var update = {};
+        update[entry.store] = entry.payload;
 
-        // fromCache=true  → dado ainda no cache local (escrita pendente)
-        // fromCache=false + hasPendingWrites=false → confirmação do servidor
-        var fromCache  = !!(doc.metadata && doc.metadata.fromCache);
-        var hasPending = !!(doc.metadata && doc.metadata.hasPendingWrites);
-        // "dadoServidor" = snapshot veio do Firestore real, não do cache local
-        var dadoServidor = !fromCache && !hasPending;
-
-        var data = doc.data() || {};
-
-        // ── Campos simples (arrays): aplica sempre que servidor confirma ──
-        // Esses campos não têm controle de timestamp — o servidor é a fonte
-        // de verdade. Só aplicamos quando não é cache local para não
-        // sobrescrever uma edição que ainda não foi ao servidor.
-        var camposSimples = [
-          'ft_registros', 'ft_colaboradores', 'ft_postos',
-          'ft_bico_fixo', 'ft_horarios_custom'
-        ];
-        var chavesUI = [];
-
-        if (dadoServidor) {
-          camposSimples.forEach(function (key) {
-            if (data[key] !== undefined) {
-              try { localStorage.setItem(key, JSON.stringify(data[key])); } catch(e) {}
-              if (window.FT_Store) try { FT_Store.set(key, data[key]); } catch(e) {}
-              chavesUI.push(key);
-            }
+        return db
+          .collection(FIRESTORE_COLLECTION)
+          .doc(FIRESTORE_DOC_ID)
+          .set(update, { merge: true })
+          .then(function () { return true; })
+          .catch(function (err) {
+            console.warn('[FirebaseSync] Falha ao sincronizar:', err);
+            return false; // mantém na fila para tentar depois
           });
-        }
+      });
 
-        // ── ft_escalas_custom: controle por timestamp ─────────────────
-        // Mesmo em cache local, aplicamos se veio do servidor com ts mais novo.
-        // Isso garante que edições de outro dispositivo chegam mesmo se este
-        // dispositivo também editou (o mais recente vence).
+      // ── Flush imediato: drena tudo que foi enfileirado enquanto
+      //    o SDK Firebase ainda estava carregando via CDN. Sem isto,
+      //    lançamentos feitos antes do Firebase conectar ficavam presos
+      //    na fila IndexedDB e nunca chegavam ao Firestore.
+      // Garante que _online=true pois Firebase só inicializa com conexão ativa
+      SyncEngine._online = navigator.onLine;
+      console.log('[FirebaseSync] Handler registrado — drenando fila pendente…');
+      SyncEngine.flush();
+    }
+
+    // ── Bridge de escrita: usada como FALLBACK (quando a fila IndexedDB não
+    //    está disponível) e para reenviar o que ficou pendente de antes do
+    //    Firebase conectar. Não é mais o caminho principal — ver saveConfig().
+    window._ftAlertConfigSync = function (cfg) {
+      var upd = { ft_alert_config: cfg };
+      // Inclui o timestamp da edição (salvo em localStorage por saveConfig)
+      // para que o listener onSnapshot, em qualquer dispositivo, saiba se
+      // este dado é mais novo que o que ele já tem antes de aplicá-lo.
+      try {
+        var tsCfg = parseInt(localStorage.getItem('ft_alert_config_ts') || '0', 10);
+        if (tsCfg) upd['ft_alert_config_ts'] = tsCfg;
+      } catch(e) {}
+      // BUG CORRIGIDO: esta função gravava também o ft_escalas_custom atual
+      // junto com a config, em PARALELO com a gravação própria das escalas
+      // (em salvarEscalaCustom). Como são duas gravações assíncronas
+      // independentes sem ordem garantida, salvar uma config (ex.: ativar/
+      // desativar alerta, adicionar um posto) podia chegar ao Firestore
+      // DEPOIS de um turno recém-adicionado e sobrescrevê-lo com um valor
+      // de escala mais antigo — o turno "desaparecia" para os outros
+      // dispositivos. As escalas agora têm seu próprio caminho exclusivo de
+      // sincronização (a fila), então não são mais duplicadas aqui.
+      db.collection(FIRESTORE_COLLECTION)
+        .doc(FIRESTORE_DOC_ID)
+        .set(upd, { merge: true })
+        .catch(function (e) { console.warn('[AlertSync] Erro ao gravar config:', e); });
+    };
+
+    // ── Dispara config que foi salva antes do Firebase conectar ──
+    if (window._ftAlertConfigPending) {
+      try { window._ftAlertConfigSync(window._ftAlertConfigPending); } catch(e) {}
+      window._ftAlertConfigPending = null;
+    }
+
+    // ── Dispara ft_escalas_custom pendente (salva antes do Firebase conectar) ──
+    if (window._ftEscalaCustomPending) {
+      try {
+        var col = FIRESTORE_COLLECTION || 'folga_trabalhada';
+        var did = FIRESTORE_DOC_ID     || 'dados';
+        var updEsc = { ft_escalas_custom: window._ftEscalaCustomPending };
+        if (window._ftEscalaCustomPendingTs) updEsc['ft_escalas_custom_ts'] = window._ftEscalaCustomPendingTs;
+        db.collection(col).doc(did)
+          .set(updEsc, { merge: true })
+          .catch(function(e){ console.warn('[EscalaSync pending]', e); });
+        window._ftEscalaCustomPending = null;
+        window._ftEscalaCustomPendingTs = null;
+      } catch(e) {}
+    }
+
+
+    // ── Listener em tempo real (recebe mudanças de outros dispositivos) ──
+    db.collection(FIRESTORE_COLLECTION)
+      .doc(FIRESTORE_DOC_ID)
+      .onSnapshot(function (doc) {
+        if (!doc.exists) return;
+        var data = doc.data();
+
+        // Atualiza localStorage e IndexedDB com dados remotos
+        var chavesAtualizadas   = [];
+        var escalasAtualizadas  = false;
+        var alertCfgAtualizado  = false;
+
+        ['ft_registros', 'ft_colaboradores', 'ft_postos', 'ft_bico_fixo',
+         'ft_horarios_custom'].forEach(function (key) {
+          if (data[key] !== undefined) {
+            try { localStorage.setItem(key, JSON.stringify(data[key])); } catch (e) {}
+            if (window.FT_Store) FT_Store.set(key, data[key]);
+            chavesAtualizadas.push(key);
+          }
+        });
+
+        // ── ft_escalas_custom: aplica o valor remoto SOMENTE se o timestamp
+        //    de gravação remoto não for mais antigo que a última edição feita
+        //    neste dispositivo. O timestamp fica salvo em localStorage (não
+        //    em memória), então sobrevive a um reload da página — é isso que
+        //    impede que uma edição feita pouco antes de recarregar a página
+        //    seja revertida por um snapshot do Firestore que ainda não tinha
+        //    recebido a gravação no momento em que a página recarregou.
         if (data['ft_escalas_custom'] !== undefined) {
-          var tsEscRemoto = parseInt(data['ft_escalas_custom_ts'] || 0, 10) || 0;
-          var escalasRemotoObj = _ftDeserializeEscalas(data['ft_escalas_custom']);
-          if (aplicarSeNovo('ft_escalas_custom', escalasRemotoObj, tsEscRemoto)) {
-            if (dadoServidor) chavesUI.push('ft_escalas_custom');
-            // Recarrega ESCALAS_POSTOS em memória com os novos dados
-            if (typeof window._ftRecarregarEscalas === 'function') {
-              try { window._ftRecarregarEscalas(); } catch(e) {}
-            }
+          var remoteTsEsc = parseInt(data['ft_escalas_custom_ts'] || 0, 10) || 0;
+          var localTsEsc  = parseInt(localStorage.getItem('ft_escalas_custom_ts') || '0', 10) || 0;
+          if (remoteTsEsc >= localTsEsc) {
+            try { localStorage.setItem('ft_escalas_custom', JSON.stringify(data['ft_escalas_custom'])); } catch (e) {}
+            try { localStorage.setItem('ft_escalas_custom_ts', String(remoteTsEsc)); } catch (e) {}
+            if (window.FT_Store) FT_Store.set('ft_escalas_custom', data['ft_escalas_custom']);
+            chavesAtualizadas.push('ft_escalas_custom');
+            escalasAtualizadas = true;
           }
+          // Se remoteTsEsc < localTsEsc: nossa edição local é mais nova que o
+          // que está no Firestore agora — ignora este snapshot. A própria
+          // gravação pendente (FT_SyncQueue) vai corrigir o servidor em breve.
         }
 
-        // ── ft_alert_config: controle por timestamp ───────────────────
-        var alertCfgAtualizado = false;
+        // Sincroniza ft_alert_config (mesma lógica de timestamp acima)
         if (data['ft_alert_config'] !== undefined) {
-          var tsCfgRemoto = parseInt(data['ft_alert_config_ts'] || 0, 10) || 0;
-          var tsCfgLocal  = getLocalTs('ft_alert_config');
-
-          // Aplica se: servidor tem ts mais novo OU não há ts local ainda
-          if (tsCfgRemoto >= tsCfgLocal || tsCfgLocal === 0) {
-            var remotoRaw = JSON.stringify(data['ft_alert_config']);
-            var localRaw  = localStorage.getItem('ft_alert_config') || 'null';
-            if (remotoRaw !== localRaw) {
-              window._ftApplyingRemote = true;
-              try { localStorage.setItem('ft_alert_config', remotoRaw); } catch(e) {}
-              window._ftApplyingRemote = false;
-              if (tsCfgRemoto > 0) setLocalTs('ft_alert_config', tsCfgRemoto);
-              alertCfgAtualizado = true;
-            }
+          var remoteTsCfg = parseInt(data['ft_alert_config_ts'] || 0, 10) || 0;
+          var localTsCfg  = parseInt(localStorage.getItem('ft_alert_config_ts') || '0', 10) || 0;
+          if (remoteTsCfg >= localTsCfg) {
+          var remotoCfg = data['ft_alert_config'];
+          // Sempre aplica: normaliza pela serialização para comparação estável
+          var localRaw  = localStorage.getItem('ft_alert_config') || 'null';
+          var remotoRaw = JSON.stringify(remotoCfg);
+          var localCfg  = null;
+          try { localCfg = JSON.parse(localRaw); } catch(e) {}
+          // Compara postos (principal campo que causa dessincronização)
+          var postosDifere = JSON.stringify((remotoCfg.postos||[]).slice().sort())
+                          !== JSON.stringify(((localCfg||{}).postos||[]).slice().sort());
+          var outroCampo  = JSON.stringify(remotoCfg) !== JSON.stringify(localCfg);
+          if (postosDifere || outroCampo) {
+            window._ftApplyingRemote = true;
+            try { localStorage.setItem('ft_alert_config', remotoRaw); } catch(e) {}
+            window._ftApplyingRemote = false;
+            alertCfgAtualizado = true;
+          }
+          try { localStorage.setItem('ft_alert_config_ts', String(remoteTsCfg)); } catch(e) {}
           }
         }
 
-        // ── ft_ciclo_inicio ───────────────────────────────────────────
+        // Sincroniza ft_ciclo_inicio (timestamp numérico)
         if (data['ft_ciclo_inicio'] !== undefined) {
           try { localStorage.setItem('ft_ciclo_inicio', String(data['ft_ciclo_inicio'])); } catch(e) {}
         }
 
-        // ── ft_alert_snoozed ──────────────────────────────────────────
+        // Sincroniza ft_alert_snoozed
         if (data['ft_alert_snoozed'] !== undefined) {
           try {
             if (!data['ft_alert_snoozed']) localStorage.removeItem('ft_alert_snoozed');
@@ -7307,152 +7303,77 @@ window._ftFirebaseConectado = false;
           } catch(e) {}
         }
 
-        // ── Atualiza UI ───────────────────────────────────────────────
-        if (alertCfgAtualizado) {
+        // Aplica dados remotos na UI (memória + re-render) para todas as chaves recebidas
+        if (chavesAtualizadas.length > 0 && typeof window._ftAplicarDadosRemotos === 'function') {
+          try { window._ftAplicarDadosRemotos(chavesAtualizadas); } catch(e) {}
+        }
+
+        // Recarrega ESCALAS_POSTOS em memória quando escalas ou config chegam do Firestore
+        if (escalasAtualizadas || alertCfgAtualizado) {
+          if (typeof window._ftRecarregarEscalas === 'function') {
+            try { window._ftRecarregarEscalas(); } catch(e) {}
+          }
+          // Re-renderiza TODA a UI de alertas para refletir a config remota
           if (typeof window._ftAlertRender === 'function') {
             try { window._ftAlertRender(); } catch(e) {}
           }
-        }
-
-        if (chavesUI.length > 0) {
-          if (typeof window._ftAplicarDadosRemotos === 'function') {
-            try { window._ftAplicarDadosRemotos(chavesUI); } catch(e) {}
+          if (typeof window.updateHeaderBadge === 'function') {
+            try { window.updateHeaderBadge(); } catch(e) {}
           }
         }
 
-        // ── Dispara verificação de alertas quando dado vem do servidor ──
-        // Só quando é confirmação real do servidor (não cache local),
-        // para evitar disparar o modal duas vezes para a mesma mudança.
-        if (dadoServidor && (chavesUI.length > 0 || alertCfgAtualizado)) {
+        // Reavalia alertas imediatamente quando dados mudam
+        if (chavesAtualizadas.length > 0 || escalasAtualizadas || alertCfgAtualizado) {
           setTimeout(function () {
-            if (typeof window._ftScheduledCheck === 'function') {
+            if (typeof window._ftCheckAndAlert === 'function') {
+              window._ftCheckAndAlert();
+            } else if (typeof window._ftScheduledCheck === 'function') {
               window._ftScheduledCheck();
             } else if (typeof window._ftUpdateBadge === 'function') {
               window._ftUpdateBadge();
             }
-          }, 400);
-        } else if (alertCfgAtualizado || chavesUI.length > 0) {
-          // Cache local: apenas atualiza badge sem modal
-          setTimeout(function () {
-            if (typeof window._ftUpdateBadge === 'function') window._ftUpdateBadge();
-          }, 200);
+          }, 500);
         }
 
-        // Notifica UI geral
+        // ft_alert_config já tratado acima junto com ft_escalas_custom
+
+        // Notifica a UI (fromSnapshot=true para não exibir toast)
         if (typeof window.onSyncComplete === 'function') {
-          try { window.onSyncComplete(true); } catch(e) {}
+          window.onSyncComplete(true);
         }
-
       }, function (err) {
-        console.warn('[FB] Listener error:', err.code, err.message);
-        // Recria listener após erro (rede instável etc.)
-        setTimeout(function () {
-          if (_db) criarListener(_db);
-        }, 5000);
+        console.warn('[FirebaseSync] Listener error:', err);
       });
-  }
 
-  // ── Inicializa Firebase e cria listener ───────────────────
-  function initFirebase() {
-    var app;
-    try { app = firebase.app(); }
-    catch(e) { app = firebase.initializeApp(FIREBASE_CONFIG); }
-
-    var db = firebase.firestore();
-    _db = db;
-
-    // ── Registra o handler de escrita no SyncEngine ──────────
-    if (window.SyncEngine) {
-      SyncEngine.setRemote(function (entry) {
-        var update;
-        if (typeof entry.store === 'string' && entry.store.indexOf('__') === 0
-            && entry.payload && typeof entry.payload === 'object') {
-          update = entry.payload;
-        } else {
-          update = {};
-          update[entry.store] = entry.payload;
-        }
-        return db
-          .collection(FIRESTORE_COLLECTION)
-          .doc(FIRESTORE_DOC_ID)
-          .set(update, { merge: true })
-          .then(function () { return true; })
-          .catch(function (err) {
-            console.warn('[FB] Falha ao sincronizar:', err);
-            return false;
-          });
-      });
-      SyncEngine._online = navigator.onLine;
-      SyncEngine.flush();
-    }
-
-    // ── Implementações reais das funções de gravação ──────────
-    window._ftSalvarEscalaFirebase = function(custom, ts) {
-      var payload = { ft_escalas_custom: _ftSerializeEscalas(custom) };
-      if (ts) payload['ft_escalas_custom_ts'] = ts;
-      db.collection(FIRESTORE_COLLECTION)
-        .doc(FIRESTORE_DOC_ID)
-        .set(payload, { merge: true })
-        .then(function () { console.log('[FB] Escala salva'); })
-        .catch(function(e) { console.warn('[FB] Escala erro:', e); });
-    };
-
-    window._ftSalvarAlertConfigFirebase = function(cfg, ts) {
-      var payload = { ft_alert_config: cfg };
-      if (ts) payload['ft_alert_config_ts'] = ts;
-      db.collection(FIRESTORE_COLLECTION)
-        .doc(FIRESTORE_DOC_ID)
-        .set(payload, { merge: true })
-        .then(function () { console.log('[FB] AlertConfig salva'); })
-        .catch(function(e) { console.warn('[FB] AlertConfig erro:', e); });
-    };
-
-    // ── Função de sync forçado de escala ─────────────────────
-    window._ftForceSyncEscala = function() {
-      try {
-        var custom = JSON.parse(localStorage.getItem('ft_escalas_custom') || '{}');
-        var ts     = getLocalTs('ft_escalas_custom') || Date.now();
-        window._ftSalvarEscalaFirebase(custom, ts);
-      } catch(e) {}
-    };
-
-    // ── Drena dados que ficaram pendentes antes da conexão ───
-    if (window._ftPending) {
-      var p = window._ftPending;
-      if (p.escala) {
-        window._ftSalvarEscalaFirebase(p.escala.data, p.escala.ts);
-      }
-      if (p.alertCfg) {
-        window._ftSalvarAlertConfigFirebase(p.alertCfg.data, p.alertCfg.ts);
-      }
-      window._ftPending = {};
-    }
-
-    // ── Cria o listener em tempo real ────────────────────────
-    criarListener(db);
-
-    // ── Expõe db globalmente para snooze e outros módulos ────
-    window.firebaseDB = db;
     window._ftFirebaseConectado = true;
-    console.log('[FB] Conectado:', FIREBASE_CONFIG.projectId);
+    console.log('[FirebaseSync] ✅ Conectado ao Firestore:', FIREBASE_CONFIG.projectId);
   }
 
-  // ── Função de reconexão (usada pelo botão de Diagnóstico) ─
+  // ── Permite forçar uma (re)conexão real, usada pelo botão de Diagnóstico
+  //    quando o SDK ainda não carregou ou o listener nunca conectou ──
   window._ftReconectarFirebase = function () {
-    if (window._ftFirebaseConectado) {
-      // Já conectado: apenas recria o listener (pode ter caído)
-      if (_db) criarListener(_db);
-      return;
-    }
+    if (window._ftFirebaseConectado) return; // já conectado, nada a fazer
     iniciarCarregamento();
   };
 
-  // ── Carregamento encadeado dos SDKs ──────────────────────
   function iniciarCarregamento() {
+    // Carrega SDKs do Firebase em sequência e inicializa.
+    // CRÍTICO: initFirebase() (que liga o listener onSnapshot em tempo real)
+    // NÃO depende mais do SDK de Messaging. Antes, a cadeia era:
+    //   app-compat → firestore-compat → messaging-compat → initFirebase()
+    // Se o script de Messaging falhasse ao carregar (comum: bloqueado por
+    // ad-blocker/uBlock/Brave, que tratam "firebase-messaging" como rastreador),
+    // o callback nunca disparava e initFirebase() NUNCA era chamado — ou seja,
+    // o listener em tempo real nunca era criado e a sincronização automática
+    // entre dispositivos simplesmente não existia, em silêncio, sem nenhum
+    // erro visível (o botão de Diagnóstico funcionava porque chama
+    // firebase.firestore() direto, sem depender dessa cadeia).
+    // Agora Messaging carrega em paralelo, de forma best-effort, e nunca
+    // bloqueia a conexão real ao Firestore.
     loadScript('https://www.gstatic.com/firebasejs/9.22.2/firebase-app-compat.js', function () {
       loadScript('https://www.gstatic.com/firebasejs/9.22.2/firebase-firestore-compat.js', function () {
         initFirebase();
-        // Messaging é opcional — carrega em paralelo, não bloqueia sync
+        // Messaging (push) é opcional — carrega em paralelo, sem travar o sync
         loadScript('https://www.gstatic.com/firebasejs/9.22.2/firebase-messaging-compat.js', function () {
           if (typeof window._ftMessagingReady === 'function') window._ftMessagingReady();
         });
@@ -7461,20 +7382,9 @@ window._ftFirebaseConectado = false;
   }
 
   iniciarCarregamento();
-
-  // ── Reconecta automaticamente ao voltar online ───────────
-  window.addEventListener('online', function () {
-    console.log('[FB] Online — reconectando listener...');
-    setTimeout(function () {
-      if (_db) criarListener(_db);
-      if (window.SyncEngine) SyncEngine.flush();
-    }, 1000);
-  });
-
 }());
 
 </script>
-
 
 <!-- ════════════════════════════════════════════════════════
      MÓDULO FCM — Push Notifications
@@ -7565,22 +7475,14 @@ window._ftFirebaseConectado = false;
   function hookAlertModule() {
     if (window._ftCheckAndAlertOriginal) return; // já hookeado
     window._ftCheckAndAlertOriginal = true;
-
-    // FIX: em vez de capturar _ftCheckAndAlert por valor (que podia ser undefined
-    // antes do init() do módulo de alertas rodar), guarda uma referência separada
-    // e re-expõe _ftCheckAndAlert como wrapper que chama o real por nome, sem
-    // Object.defineProperty que causava race condition entre os módulos.
-    var _realCheckAndAlert = null;
-
+    var realFn = (typeof window._ftCheckAndAlert === 'function') ? window._ftCheckAndAlert : null;
+    Object.defineProperty(window, '_ftCheckAndAlert', {
+      configurable: true,
+      get: function () { return wrapped; },
+      set: function (fn) { realFn = fn; }
+    });
     function wrapped() {
-      // Busca a função real no momento da chamada (não no momento do hook)
-      if (_realCheckAndAlert === null) {
-        // Primeira chamada: tenta localizar a função real salva antes do wrapper
-        _realCheckAndAlert = window._ftCheckAndAlertReal || null;
-      }
-      if (typeof _realCheckAndAlert === 'function') {
-        try { _realCheckAndAlert(); } catch(e) {}
-      }
+      if (typeof realFn === 'function') realFn();
       // Dispara push local se há pendências
       setTimeout(function () {
         try {
@@ -7591,13 +7493,6 @@ window._ftFirebaseConectado = false;
         } catch (e) {}
       }, 600);
     }
-
-    // Salva referência real ANTES de sobrescrever
-    if (typeof window._ftCheckAndAlert === 'function') {
-      window._ftCheckAndAlertReal = window._ftCheckAndAlert;
-      _realCheckAndAlert = window._ftCheckAndAlert;
-    }
-    window._ftCheckAndAlert = wrapped;
   }
 
   // Aguarda Firebase carregar e então inicializa FCM
@@ -7876,62 +7771,39 @@ window._ftFirebaseConectado = false;
           <div style="font-size:.72rem;color:#8b97b0;">💡 Saída após meia-noite (ex: 18:00→06:00) é detectada automaticamente.</div>
         </div>
 
-        <!-- ══ BOTÃO MASTER DE PUBLICAÇÃO ══ -->
-        <style>
-          @keyframes masterBtnPulse {
-            0%,100% { box-shadow:0 4px 20px rgba(247,183,49,.5),0 0 0 0 rgba(247,183,49,.3); }
-            50%      { box-shadow:0 8px 36px rgba(247,183,49,.85),0 0 0 6px rgba(247,183,49,.08); }
-          }
-          #ft-escala-btn-sync {
-            width:100%;border:none;border-radius:14px;
-            background:linear-gradient(135deg,#f7b731 0%,#fd9644 45%,#fc5c65 100%);
-            color:#0d1117;font-family:'Exo 2',sans-serif;
-            font-size:.92rem;font-weight:900;letter-spacing:1.1px;text-transform:uppercase;
-            padding:17px 10px;cursor:pointer;margin-bottom:10px;
-            display:flex;align-items:center;justify-content:center;gap:10px;
-            animation:masterBtnPulse 2.2s ease-in-out infinite;
-            transition:transform .15s,filter .15s;
-            border-top:2px solid rgba(255,255,255,.25);
-          }
-          #ft-escala-btn-sync:active  { transform:scale(.97); filter:brightness(.92); }
-          #ft-escala-btn-sync:disabled { opacity:.65; cursor:default; animation:none; }
-          #ft-escala-sync-label { flex:1; text-align:center; }
-        </style>
-        <div id="ft-escala-sync-glow" style="display:none;"></div><!-- mantido para compatibilidade JS -->
-        <button id="ft-escala-btn-sync">
-          <span style="font-size:1.2rem;">⚡</span>
-          <span id="ft-escala-sync-label">PUBLICAR ESCALA EM TODOS OS DISPOSITIVOS</span>
-          <span style="font-size:1.2rem;">☁️</span>
-        </button>
-
         <button id="ft-escala-btn-limpar" style="width:100%;border:1.5px dashed rgba(252,92,101,.4);border-radius:8px;background:rgba(252,92,101,.07);color:#fc5c65;font-family:'Exo 2',sans-serif;font-size:.75rem;font-weight:700;padding:9px;cursor:pointer;margin-bottom:2px;">
           🗑️ Remover toda a escala deste posto
         </button>
       </div>
     </div>
 
-    <!-- Botões inferiores -->
-    <div style="display:flex;flex-direction:column;gap:8px;margin-top:14px;">
-      <!-- Sync forçado geral (config + escalas) -->
-      <button id="ft-config-force-sync" style="
-        width:100%;border:none;border-radius:12px;
-        background:linear-gradient(135deg,#45aaf2,#1a6fc4);
-        color:#fff;font-family:'Exo 2',sans-serif;font-size:.88rem;font-weight:700;
-        padding:13px;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px;
-      ">☁️ Forçar Sincronização com Firebase</button>
-      <div style="display:flex;gap:10px;">
-        <button id="ft-config-close" style="
-          flex:1;border:1.5px solid #2a3347;border-radius:12px;
-          background:transparent;color:#8b97b0;font-family:'Exo 2',sans-serif;
-          font-size:.88rem;font-weight:700;padding:13px;cursor:pointer;
-        ">✕ Fechar</button>
-        <button id="ft-config-test" style="
-          flex:1;border:none;border-radius:12px;
-          background:rgba(247,183,49,.15);border:1.5px solid rgba(247,183,49,.4);
-          color:#f7b731;font-family:'Exo 2',sans-serif;font-size:.88rem;
-          font-weight:700;padding:13px;cursor:pointer;
-        ">🔔 Testar Alerta Agora</button>
-      </div>
+    <!-- Botões fechar -->
+    <div style="display:flex;gap:10px;margin-top:14px;">
+      <button id="ft-config-close" style="
+        flex:1;
+        border:1.5px solid #2a3347;
+        border-radius:12px;
+        background:transparent;
+        color:#8b97b0;
+        font-family:'Exo 2',sans-serif;
+        font-size:.88rem;
+        font-weight:700;
+        padding:13px;
+        cursor:pointer;
+      ">✕ Fechar</button>
+      <button id="ft-config-test" style="
+        flex:1;
+        border:none;
+        border-radius:12px;
+        background:rgba(247,183,49,.15);
+        border:1.5px solid rgba(247,183,49,.4);
+        color:#f7b731;
+        font-family:'Exo 2',sans-serif;
+        font-size:.88rem;
+        font-weight:700;
+        padding:13px;
+        cursor:pointer;
+      ">🔔 Testar Alerta Agora</button>
     </div>
   </div>
 </div>
@@ -8087,19 +7959,18 @@ window._ftFirebaseConectado = false;
       //    podia sobrescrever no servidor um turno recém-adicionado em
       //    outra ação, com um valor de escala mais antigo. A fila grava em
       //    ordem, um item por vez — elimina essa corrida.
-      // ── Grava direto no Firestore (caminho principal) ──────────────
-      window._ftSalvarAlertConfigFirebase(cfg, _tsCfg);
-
-      // ── Enfileira também (fallback/offline) ──────────────────────
       if (window.FT_SyncQueue) {
-        FT_SyncQueue.enqueue('set', '__alert_config_payload__',
-          { ft_alert_config: cfg, ft_alert_config_ts: _tsCfg }
-        ).then(function() {
+        FT_SyncQueue.enqueue('set', LS_CONFIG, cfg).then(function() {
+          if (window.SyncEngine) SyncEngine.flush();
+        });
+        FT_SyncQueue.enqueue('set', 'ft_alert_config_ts', _tsCfg).then(function() {
           if (window.SyncEngine) SyncEngine.flush();
         });
       } else if (typeof window._ftAlertConfigSync === 'function') {
+        // Fallback: só usado se a fila IndexedDB estiver indisponível neste navegador
         try { window._ftAlertConfigSync(cfg); } catch (e) {}
       } else {
+        // Nem fila nem Firebase disponíveis ainda — guarda para enviar assim que conectar
         window._ftAlertConfigPending = cfg;
       }
     }
@@ -8637,12 +8508,7 @@ window._ftFirebaseConectado = false;
           btnDel.dataset.dia = diaIdx;
           btnDel.dataset.idx = tIdx;
           btnDel.addEventListener('click', function() {
-            try {
-              deletarTurnoEscala(postoNome, parseInt(this.dataset.dia), parseInt(this.dataset.idx));
-            } catch (e) {
-              console.error('[Escala] Erro ao remover turno:', e);
-              if (typeof window.showToast === 'function') window.showToast('❌ Erro ao remover turno: ' + e.message, 'error');
-            }
+            deletarTurnoEscala(postoNome, parseInt(this.dataset.dia), parseInt(this.dataset.idx));
           });
 
           chip.appendChild(label);
@@ -8660,18 +8526,6 @@ window._ftFirebaseConectado = false;
     var semana = (esc && esc.semana) ? esc.semana.map(function(d){ return (d||[]).slice(); }) : [[],[],[],[],[],[],[]];
     while (semana.length < 7) semana.push([]);
     return semana;
-  }
-
-  // Salva escala APENAS localmente (localStorage + memória), sem enviar ao Firebase.
-  // Usada pela migração de postos sem escala, para evitar que a escala padrão
-  // 18:00–06:00 seja gravada no Firestore com timestamp novo, o que causaria
-  // sobrescrita da escala real do usuário no próximo onSnapshot.
-  function salvarEscalaCustomSomenteLocal(postoNome, semana) {
-    var custom = loadEscalasCustom();
-    custom[postoNome] = semana;
-    saveEscalasCustom(custom);
-    ESCALAS_POSTOS[postoNome] = { semana: semana };
-    // NÃO atualiza ft_escalas_custom_ts e NÃO chama _ftSalvarEscalaFirebase
   }
 
   function salvarEscalaCustom(postoNome, semana) {
@@ -8696,22 +8550,29 @@ window._ftFirebaseConectado = false;
     //    nos outros dispositivos (ou depois de limpar o app/recarregar sem
     //    cache local). A fila processa as gravações em ORDEM, uma de cada
     //    vez, o que elimina essa corrida.
-    // ── Grava direto no Firestore (caminho principal) ──────────────
-    // Não depende da fila IndexedDB que pode estar atrasada/bloqueada.
-    // É a única gravação que realmente persiste entre sessões/dispositivos.
-    window._ftSalvarEscalaFirebase(custom, _ts);
-
-    // ── Enfileira também na fila (fallback/offline) ──────────────────
     if (window.FT_SyncQueue) {
-      FT_SyncQueue.enqueue('set', '__escalas_payload__',
-        { ft_escalas_custom: _ftSerializeEscalas(custom), ft_escalas_custom_ts: _ts }
-      ).then(function() {
+      FT_SyncQueue.enqueue('set', 'ft_escalas_custom', custom).then(function() {
         if (window.SyncEngine) SyncEngine.flush();
       });
-    }
-    if (!window.FT_SyncQueue && !window._ftFirebaseConectado) {
-      window._ftEscalaCustomPending    = custom;
-      window._ftEscalaCustomPendingTs  = _ts;
+      FT_SyncQueue.enqueue('set', 'ft_escalas_custom_ts', _ts).then(function() {
+        if (window.SyncEngine) SyncEngine.flush();
+      });
+    } else if (typeof window._ftAlertConfigSync === 'function') {
+      // Fallback: só usado se a fila IndexedDB estiver indisponível neste navegador
+      try {
+        var upd = { ft_escalas_custom: custom, ft_escalas_custom_ts: _ts };
+        var col = window.FIRESTORE_COLLECTION || 'folga_trabalhada';
+        var did = window.FIRESTORE_DOC_ID     || 'dados';
+        if (typeof firebase !== 'undefined') {
+          firebase.firestore().collection(col).doc(did)
+            .set(upd, { merge: true })
+            .catch(function(e){ console.warn('[EscalaSync]', e); });
+        }
+      } catch(e) {}
+    } else {
+      // Nem fila nem Firebase disponíveis ainda — guarda para envio posterior
+      window._ftEscalaCustomPending = custom;
+      window._ftEscalaCustomPendingTs = _ts;
     }
   }
 
@@ -8740,17 +8601,6 @@ window._ftFirebaseConectado = false;
 
     var nd = sMin <= eMin; // saída <= entrada → passa da meia-noite
     var semana = getEscalaSemanaEditavel(postoNome);
-
-    // FIX: impede turnos idênticos duplicados no mesmo dia (evita o
-    // "cliquei várias vezes achando que não funcionou" empilhar turnos repetidos).
-    var jaExiste = (semana[diaIdx] || []).some(function(t) {
-      return t.e === eMin && t.s === sMin && t.per === periodo;
-    });
-    if (jaExiste) {
-      if (typeof window.showToast === 'function') window.showToast('⚠️ Esse turno já existe nesse dia.', 'error');
-      return;
-    }
-
     semana[diaIdx].push({ e: eMin, s: sMin, nd: nd, per: periodo });
     salvarEscalaCustom(postoNome, semana);
 
@@ -8759,21 +8609,6 @@ window._ftFirebaseConectado = false;
     renderEscalaDiasList(postoNome);
     updateHeaderBadge();
     if (typeof window.showToast === 'function') window.showToast('✅ Turno adicionado!', 'success');
-
-    // FIX: rola até o dia alterado e pisca a borda, para dar feedback visual
-    // claro de que o turno foi salvo (antes não havia nenhuma pista visual
-    // além do toast, que podia passar despercebido no celular).
-    setTimeout(function() {
-      var diasEl = document.getElementById('ft-escala-dias-list');
-      if (!diasEl) return;
-      var rowDia = diasEl.children[diaIdx];
-      if (!rowDia) return;
-      rowDia.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      var corOriginal = rowDia.style.borderColor;
-      rowDia.style.transition = 'border-color .3s';
-      rowDia.style.borderColor = '#26de81';
-      setTimeout(function() { rowDia.style.borderColor = corOriginal; }, 1200);
-    }, 50);
   }
 
   function deletarTurnoEscala(postoNome, diaIdx, turnoIdx) {
@@ -8784,16 +8619,6 @@ window._ftFirebaseConectado = false;
     updateHeaderBadge();
     if (typeof window.showToast === 'function') window.showToast('🗑️ Turno removido.', 'error');
   }
-
-  // Exposta para o onSnapshot chamar quando recebe escalas de outro dispositivo
-  window._ftRecarregarEscalas = function() {
-    try {
-      var custom = JSON.parse(localStorage.getItem('ft_escalas_custom') || '{}');
-      for (var k in custom) { ESCALAS_POSTOS[k] = { semana: custom[k] }; }
-    } catch(e) {}
-    try { renderEscalaSelectPostos(); } catch(e) {}
-    if (_escalaPosToEdit) { try { renderEscalaDiasList(_escalaPosToEdit); } catch(e) {} }
-  };
 
   function initEscalaEditor() {
     renderEscalaSelectPostos();
@@ -8813,61 +8638,8 @@ window._ftFirebaseConectado = false;
     var btnAdd = document.getElementById('ft-escala-btn-add-turno');
     if (btnAdd) {
       btnAdd.addEventListener('click', function() {
-        if (!_escalaPosToEdit) {
-          if (typeof window.showToast === 'function') window.showToast('⚠️ Nenhum posto selecionado. Toque em "Editar" primeiro.', 'error');
-          return;
-        }
-        // FIX: blinda o clique com try/catch — qualquer falha inesperada
-        // (ex.: Firebase ainda conectando) agora mostra um erro visível
-        // em vez de o botão parecer não fazer nada.
-        try {
-          adicionarTurnoEscala(_escalaPosToEdit);
-        } catch (e) {
-          console.error('[Escala] Erro ao adicionar turno:', e);
-          if (typeof window.showToast === 'function') window.showToast('❌ Erro ao salvar turno: ' + e.message, 'error');
-        }
-      });
-    }
-
-    var btnSync = document.getElementById('ft-escala-btn-sync');
-    var btnSyncGlow = document.getElementById('ft-escala-sync-glow');
-    if (btnSync) {
-      btnSync.addEventListener('click', function() {
-        if (!_escalaPosToEdit) {
-          if (typeof window.showToast === 'function') window.showToast('⚠️ Nenhum posto selecionado.', 'error');
-          return;
-        }
-        var custom = loadEscalasCustom();
-        var _ts    = Date.now();
-        try { localStorage.setItem('ft_escalas_custom_ts', String(_ts)); } catch(e) {}
-        if (typeof window._ftSalvarEscalaFirebase === 'function') {
-          // Estado: enviando
-          var label = document.getElementById('ft-escala-sync-label');
-          btnSync.disabled = true;
-          if (btnSyncGlow) btnSyncGlow.style.background = 'linear-gradient(135deg,#45aaf2,#26de81,#45aaf2)';
-          if (label) label.textContent = 'ENVIANDO PARA O FIREBASE…';
-          btnSync.style.background = 'linear-gradient(135deg,#45aaf2 0%,#26de81 100%)';
-          btnSync.style.boxShadow  = '0 6px 28px rgba(69,170,242,.55),0 2px 8px rgba(0,0,0,.4)';
-
-          window._ftSalvarEscalaFirebase(custom, _ts);
-
-          setTimeout(function() {
-            // Estado: sucesso
-            if (label) label.textContent = '✅ ESCALA PUBLICADA COM SUCESSO!';
-            btnSync.style.background = 'linear-gradient(135deg,#26de81 0%,#20a862 100%)';
-            if (btnSyncGlow) btnSyncGlow.style.background = 'linear-gradient(135deg,#26de81,#45aaf2,#26de81)';
-            setTimeout(function() {
-              // Volta ao estado normal
-              btnSync.disabled = false;
-              if (label) label.textContent = 'PUBLICAR ESCALA EM TODOS OS DISPOSITIVOS';
-              btnSync.style.background = 'linear-gradient(135deg,#f7b731 0%,#fd9644 50%,#fc5c65 100%)';
-              btnSync.style.boxShadow  = '0 6px 28px rgba(247,183,49,.55),0 2px 8px rgba(0,0,0,.4)';
-              if (btnSyncGlow) btnSyncGlow.style.background = 'linear-gradient(135deg,#f7b731,#fd9644,#fc5c65,#f7b731)';
-            }, 2000);
-          }, 1800);
-        } else {
-          if (typeof window.showToast === 'function') window.showToast('⚠️ Firebase ainda não conectado.', 'error');
-        }
+        if (!_escalaPosToEdit) return;
+        adicionarTurnoEscala(_escalaPosToEdit);
       });
     }
 
@@ -8885,11 +8657,11 @@ window._ftFirebaseConectado = false;
         // em salvarEscalaCustom — sem isso a remoção ficava só neste aparelho).
         var _tsLimpar = Date.now();
         try { localStorage.setItem('ft_escalas_custom_ts', String(_tsLimpar)); } catch(e) {}
-        window._ftSalvarEscalaFirebase(custom, _tsLimpar);
         if (window.FT_SyncQueue) {
-          FT_SyncQueue.enqueue('set', '__escalas_payload__',
-            { ft_escalas_custom: _ftSerializeEscalas(custom), ft_escalas_custom_ts: _tsLimpar }
-          ).then(function() {
+          FT_SyncQueue.enqueue('set', 'ft_escalas_custom', custom).then(function() {
+            if (window.SyncEngine) SyncEngine.flush();
+          });
+          FT_SyncQueue.enqueue('set', 'ft_escalas_custom_ts', _tsLimpar).then(function() {
             if (window.SyncEngine) SyncEngine.flush();
           });
         }
@@ -8930,34 +8702,20 @@ window._ftFirebaseConectado = false;
     if (_ftMigracaoEscalaJaExecutada) return;
     _ftMigracaoEscalaJaExecutada = true;
     var cfgMig = loadConfig();
-    var _customMig = loadEscalasCustom(); // BUG CORRIGIDO: verifica também localStorage
     cfgMig.postos.forEach(function(posto) {
       var normP = norm(posto);
       var temEscala = false;
-      // 1) verifica em memória
       for (var k in ESCALAS_POSTOS) {
         if (norm(k) === normP) { temEscala = true; break; }
       }
-      // 2) verifica no localStorage (evita sobrescrever escala custom já salva)
       if (!temEscala) {
-        for (var kc in _customMig) {
-          if (norm(kc) === normP) { temEscala = true; break; }
-        }
-      }
-      if (!temEscala) {
-        // BUG CORRIGIDO: usa salvarEscalaCustomSomenteLocal() em vez de
-        // salvarEscalaCustom(), para NÃO gravar no Firebase.
-        // A versão anterior chamava salvarEscalaCustom() que envia ao Firebase
-        // com um timestamp novo — isso fazia o Firebase armazenar a escala
-        // padrão 18:00–06:00 com ts mais recente que a escala do usuário,
-        // causando sobrescrita na próxima carga pelo onSnapshot.
         var semanaDefault = [];
         for (var d = 0; d < 7; d++) {
           semanaDefault.push([
             { e: 18*60, s: 6*60, nd: true, per: 'noite' }
           ]);
         }
-        salvarEscalaCustomSomenteLocal(posto, semanaDefault);
+        salvarEscalaCustom(posto, semanaDefault);
       }
     });
   }
@@ -9042,17 +8800,7 @@ window._ftFirebaseConectado = false;
       btnDel.type = 'button';
       btnDel.style.cssText = 'border:none;background:rgba(139,151,176,.1);color:#8b97b0;border-radius:7px;padding:3px 7px;font-size:.78rem;font-weight:700;cursor:pointer;';
       btnDel.textContent = '\u2715';
-      // FIX: captura posto por nome (não por idx) para garantir exclusão correta
-      // independente de re-renders ou closures com idx desatualizado
-      (function(postoNome) {
-        btnDel.onclick = function () {
-          var cfgAtual = loadConfig();
-          cfgAtual.postos = cfgAtual.postos.filter(function(p) { return p !== postoNome; });
-          saveConfig(cfgAtual);
-          renderConfigPostos();
-          updateHeaderBadge();
-        };
-      })(posto);
+      btnDel.onclick = function () { cfg.postos.splice(idx, 1); saveConfig(cfg); renderConfigPostos(); updateHeaderBadge(); };
 
       linha1.appendChild(lbl);
       linha1.appendChild(btnDia2);
@@ -9121,27 +8869,6 @@ window._ftFirebaseConectado = false;
 
     bind('ft-alert-config-btn', function () { hideAlertModal(); openConfigModal(); });
 
-    bind('ft-config-force-sync', function () {
-      var btn = document.getElementById('ft-config-force-sync');
-      if (btn) { btn.textContent = '⏳ Sincronizando…'; btn.disabled = true; }
-      // Sincroniza escalas
-      if (typeof window._ftForceSyncEscala === 'function') window._ftForceSyncEscala();
-      // Sincroniza config de alertas
-      try {
-        var cfg = loadConfig();
-        if (cfg && typeof window._ftSalvarAlertConfigFirebase === 'function') {
-          var ts = parseInt(localStorage.getItem('ft_alert_config_ts') || '0') || Date.now();
-          window._ftSalvarAlertConfigFirebase(cfg, ts);
-        }
-      } catch(e) {}
-      // Drena fila
-      if (window.SyncEngine) SyncEngine.flush();
-      setTimeout(function() {
-        if (btn) { btn.innerHTML = '☁️ Forçar Sincronização com Firebase'; btn.disabled = false; }
-        if (typeof window.showToast === 'function') window.showToast('☁️ Sincronização forçada enviada!', 'success');
-      }, 2500);
-    });
-
     bind('ft-config-close', function () {
       document.getElementById('ft-config-overlay').style.display = 'none';
       updateHeaderBadge();
@@ -9171,13 +8898,6 @@ window._ftFirebaseConectado = false;
         for (var k in ESCALAS_POSTOS) {
           if (norm(k) === normValCfg) { temEscala = true; break; }
         }
-        // BUG CORRIGIDO: verifica também localStorage antes de injetar padrão
-        if (!temEscala) {
-          var _customCfg = loadEscalasCustom();
-          for (var kc in _customCfg) {
-            if (norm(kc) === normValCfg) { temEscala = true; break; }
-          }
-        }
         if (!temEscala) {
           var semanaDefault = [];
           for (var d = 0; d < 7; d++) {
@@ -9185,9 +8905,7 @@ window._ftFirebaseConectado = false;
               { e: 18*60, s: 6*60, nd: true, per: 'noite' }
             ]);
           }
-          // Usa SomenteLocal para não gravar escala padrão no Firebase,
-          // evitando que ela sobrescreva uma escala real via onSnapshot
-          salvarEscalaCustomSomenteLocal(val, semanaDefault);
+          salvarEscalaCustom(val, semanaDefault);
         }
 
         renderConfigPostos();
@@ -9227,23 +8945,10 @@ window._ftFirebaseConectado = false;
     setTimeout(scheduledCheck, 1500);
 
     // Expõe funções internas ao listener Firestore e ao módulo de diagnóstico
-    window._ftScheduledCheck      = scheduledCheck;
-    window._ftCheckAndAlertReal   = checkAndAlert;  // referência real para o hook FCM
-    window._ftCheckAndAlert       = checkAndAlert;  // pode ser wrapped pelo hookAlertModule
-    window._ftUpdateBadge         = updateHeaderBadge;
-    window._ftGetPendencias       = getPendencias;  // usado pelo módulo FCM
-
-    // Se o hook FCM já rodou antes deste init(), atualiza a referência real nele
-    if (window._ftCheckAndAlertOriginal) {
-      window._ftCheckAndAlertReal = checkAndAlert;
-      // Re-expõe o wrapper com a referência correta
-      if (typeof window._ftCheckAndAlert === 'function' &&
-          window._ftCheckAndAlert !== checkAndAlert) {
-        // Já está wrapped — só atualiza _ftCheckAndAlertReal que o wrapper lê
-      } else {
-        window._ftCheckAndAlert = checkAndAlert;
-      }
-    }
+    window._ftScheduledCheck  = scheduledCheck;
+    window._ftCheckAndAlert   = checkAndAlert;
+    window._ftUpdateBadge     = updateHeaderBadge;
+    window._ftGetPendencias   = getPendencias;   // usado pelo módulo FCM
 
     // _ftAlertRender: re-renderiza toda a UI de alertas com a config atual do localStorage
     window._ftAlertRender = function() {
@@ -9256,21 +8961,11 @@ window._ftFirebaseConectado = false;
     };
 
     // _ftRecarregarEscalas: recarrega escalas custom do localStorage para memória
-    // FIX: encadeia com a versão já definida (não sobrescreve) — antes isso
-    // descartava a re-renderização do editor de escala aberto (_escalaPosToEdit),
-    // fazendo a tela de "Adicionar Turno" parecer travada quando chegava uma
-    // sincronização do Firestore logo após o usuário salvar um turno.
-    (function() {
-      var _ftRecarregarEscalasAnteriorInit = window._ftRecarregarEscalas;
-      window._ftRecarregarEscalas = function() {
-        if (typeof _ftRecarregarEscalasAnteriorInit === 'function') {
-          try { _ftRecarregarEscalasAnteriorInit(); } catch(e) {}
-        }
-        try { carregarEscalasCustomNaMemoria(); } catch(e) {}
-        try { renderEscalaSelectPostos();       } catch(e) {}
-        try { updateHeaderBadge();              } catch(e) {}
-      };
-    }());
+    window._ftRecarregarEscalas = function() {
+      try { carregarEscalasCustomNaMemoria(); } catch(e) {}
+      try { renderEscalaSelectPostos();       } catch(e) {}
+      try { updateHeaderBadge();              } catch(e) {}
+    };
 
     // Revalida quando a aba volta ao foco (usuário troca de app e volta)
     document.addEventListener('visibilitychange', function () {
@@ -9356,15 +9051,11 @@ window._ftFirebaseConectado = false;
       btn.style.cssText = 'border:none;background:rgba(139,151,176,.1);color:#8b97b0;border-radius:7px;padding:3px 7px;font-size:.78rem;font-weight:700;cursor:pointer;';
       btn.textContent = '\u2715';
       btn.title = 'Remover posto monitorado';
-      (function(postoNome) {
-        btn.onclick = function() {
-          var cfgAtual = loadConfig();
-          cfgAtual.postos = cfgAtual.postos.filter(function(p) { return p !== postoNome; });
-          saveConfig(cfgAtual);
-          renderBicoPostosMonitorados(); renderConfigPostos(); renderCadAlertasPostos(); updateHeaderBadge();
-          if (typeof window.showToast === 'function') window.showToast('\uD83D\uDDD1\uFE0F Posto removido dos monitorados.', 'error');
-        };
-      })(posto);
+      btn.onclick = function() {
+        cfg.postos.splice(idx, 1); saveConfig(cfg);
+        renderBicoPostosMonitorados(); renderConfigPostos(); renderCadAlertasPostos(); updateHeaderBadge();
+        if (typeof window.showToast === 'function') window.showToast('\uD83D\uDDD1\uFE0F Posto removido dos monitorados.', 'error');
+      };
 
       // Linha 1: dot + nome + ☀️ 🌙 + ativo + ✕
       var linha1 = document.createElement('div');
@@ -9424,26 +9115,14 @@ window._ftFirebaseConectado = false;
       saveConfig(cfg);
 
       /* ── Garante que o posto novo tem escala para gerar alertas ─────────
-         Se não existe escala hardcoded NEM customizada (localStorage),
-         injeta escala padrão 24h (Noite 18→06) em todos os dias da semana.
-         BUG CORRIGIDO: a verificação anterior só consultava ESCALAS_POSTOS
-         em memória, ignorando escalas customizadas já salvas no localStorage.
-         Após um reload, ESCALAS_POSTOS é reconstruído na inicialização, mas
-         neste ponto do código ele pode ainda não conter a escala custom —
-         causando sobrescrita do horário configurado pelo usuário com 18:00–06:00.
-         Agora verificamos também loadEscalasCustom() antes de injetar. ──────── */
+         Se não existe escala hardcoded nem customizada, injeta escala
+         padrão 24h (Dia 06→18 + Noite 18→06) em todos os dias da semana.
+         Isso permite que o alerta funcione imediatamente sem forçar o
+         usuário a configurar escala manualmente. ──────────────────────── */
       var temEscala = false;
       var normValChk = norm(val);
-      // 1) verifica em memória (hardcoded + custom já carregadas no init)
       for (var k in ESCALAS_POSTOS) {
         if (norm(k) === normValChk) { temEscala = true; break; }
-      }
-      // 2) verifica no localStorage (custom salvas que podem não estar em memória ainda)
-      if (!temEscala) {
-        var _customChk = loadEscalasCustom();
-        for (var kc in _customChk) {
-          if (norm(kc) === normValChk) { temEscala = true; break; }
-        }
       }
       if (!temEscala) {
         var semanaDefault = [];
@@ -9452,7 +9131,7 @@ window._ftFirebaseConectado = false;
             { e: 18*60, s: 6*60, nd: true, per: 'noite' }
           ]);
         }
-        salvarEscalaCustomSomenteLocal(val, semanaDefault); // somente local, sem gravar no Firebase
+        salvarEscalaCustom(val, semanaDefault); // salva no localStorage E em ESCALAS_POSTOS
       }
 
       renderBicoPostosMonitorados();
@@ -9533,16 +9212,12 @@ window._ftFirebaseConectado = false;
         btn.style.cssText = 'border:none;background:rgba(139,151,176,.1);color:#8b97b0;border-radius:7px;padding:3px 7px;font-size:.78rem;font-weight:700;cursor:pointer;';
         btn.textContent = '\u2715';
         btn.title = 'Remover posto monitorado';
-        (function(postoNome) {
-          btn.onclick = function() {
-            var cfgAtual = loadConfig();
-            cfgAtual.postos = cfgAtual.postos.filter(function(p) { return p !== postoNome; });
-            saveConfig(cfgAtual);
-            renderCadAlertasPostos(); renderCadAlertasToggles();
-            renderBicoPostosMonitorados(); renderConfigPostos(); updateHeaderBadge();
-            if (typeof window.showToast === 'function') window.showToast('\uD83D\uDDD1\uFE0F Posto removido dos monitorados.', 'error');
-          };
-        })(posto);
+        btn.onclick = function() {
+          cfg.postos.splice(idx, 1); saveConfig(cfg);
+          renderCadAlertasPostos(); renderCadAlertasToggles();
+          renderBicoPostosMonitorados(); renderConfigPostos(); updateHeaderBadge();
+          if (typeof window.showToast === 'function') window.showToast('\uD83D\uDDD1\uFE0F Posto removido dos monitorados.', 'error');
+        };
 
         // Linha 1: dot + nome + ☀️ 🌙 + ativo + ✕
         var linha1 = document.createElement('div');
@@ -9617,20 +9292,15 @@ window._ftFirebaseConectado = false;
       cfg.postos.push(val);
       saveConfig(cfg);
 
-      // Garante escala noturna padrão se não tiver escala (hardcoded nem custom)
+      // Garante escala noturna padrão se não tiver escala
       var temEscala = false;
       for (var k in ESCALAS_POSTOS) { if (norm(k) === normVal) { temEscala = true; break; } }
-      // BUG CORRIGIDO: verifica também localStorage antes de injetar padrão
-      if (!temEscala) {
-        var _customCad = loadEscalasCustom();
-        for (var kcc in _customCad) { if (norm(kcc) === normVal) { temEscala = true; break; } }
-      }
       if (!temEscala) {
         var semanaDefault = [];
         for (var d = 0; d < 7; d++) {
           semanaDefault.push([{ e: 18*60, s: 6*60, nd: true, per: 'noite' }]);
         }
-        salvarEscalaCustomSomenteLocal(val, semanaDefault);
+        salvarEscalaCustom(val, semanaDefault);
       }
 
       if (inputPosto) inputPosto.value = '';
@@ -9907,9 +9577,9 @@ window.diagSync = function () {
 
       // ── Mescla escalas customizadas ──
       var escLocal  = lerLocal(MAPA, true);
-      var escRemoto = _ftDeserializeEscalas(data[MAPA]);
+      var escRemoto = (data[MAPA] && typeof data[MAPA] === 'object') ? data[MAPA] : {};
       var escMesclado = mergeEscalasCustom(escLocal, escRemoto);
-      upd[MAPA] = _ftSerializeEscalas(escMesclado);
+      upd[MAPA] = escMesclado;
       gravarLocal(MAPA, escMesclado);
       line('🔀 ' + MAPA + ': ' + Object.keys(escMesclado).length + ' posto(s) com escala customizada', '#26de81');
 
