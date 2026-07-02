@@ -3178,6 +3178,37 @@
   // Nesta implementação o "servidor" é configurável.
   // Por padrão usa uma estratégia local (sem servidor real),
   // mas expõe window.FT_SyncEngine.setRemote(fn) para plugar Firebase/REST.
+  // ── Protege a fila contra uma gravação travada ────────────
+  // Em sinal fraco (offline persistence do Firestore), a Promise de um
+  // .set() pode ficar pendurada por muito tempo sem resolver nem rejeitar
+  // enquanto não há conexão real com o servidor. Sem isso, UMA gravação
+  // travada no início da fila bloqueava o restante para sempre (inclusive
+  // lançamentos novos, que também entram nesta mesma fila) — o `_syncing`
+  // nunca voltava a `false`, então nenhum flush() futuro rodava.
+  // Resolve como falha (mantém o item na fila para tentar de novo depois)
+  // se a gravação não responder dentro do prazo, sem travar o restante.
+  function comTimeoutFila(promise, ms) {
+    return new Promise(function(resolve) {
+      var decidido = false;
+      var timer = setTimeout(function() {
+        if (decidido) return;
+        decidido = true;
+        resolve(false);
+      }, ms);
+      promise.then(function(v) {
+        if (decidido) return;
+        decidido = true;
+        clearTimeout(timer);
+        resolve(v);
+      }, function() {
+        if (decidido) return;
+        decidido = true;
+        clearTimeout(timer);
+        resolve(false);
+      });
+    });
+  }
+
   window.SyncEngine = {
     _online: navigator.onLine,
     _syncing: false,
@@ -3267,7 +3298,9 @@
                 ? self._remoteHandler(entry)
                 : Promise.resolve(true);
 
-              return handler.then(function(ok) {
+              // FIX: 15s de prazo por gravação — evita que uma gravação
+              // travada (sinal fraco) prenda a fila inteira para sempre.
+              return comTimeoutFila(handler, 15000).then(function(ok) {
                 if (ok !== false) return FT_SyncQueue.remove(entry.qid);
               }).catch(function() { /* mantém na fila se falhar */ });
             });
