@@ -7138,22 +7138,108 @@ var FIREBASE_CONFIG = {
 var FIRESTORE_COLLECTION = 'folga_trabalhada';
 var FIRESTORE_DOC_ID     = 'dados';
 
-// ── FIX: Firestore não aceita array-dentro-de-array (nested arrays).
-// A estrutura de ft_escalas_custom é { posto: { semana: [ [turnos...], [turnos...], ... ] } }
-// — "semana" é um array de 7 arrays, o que o Firestore rejeita com o erro
-// "Nested arrays are not supported". Por isso o botão de salvar turno
-// nunca conseguia gravar de verdade na nuvem (falhava silenciosamente,
-// só logando no console.warn). A correção: serializar o mapa inteiro
-// como JSON (string) antes de enviar, e desserializar ao receber.
-function _ftSerializeEscalas(custom) {
-  try { return JSON.stringify(custom || {}); } catch (e) { return '{}'; }
+// ══════════════════════════════════════════════════════════════
+// ESTRUTURA DE DADOS DAS ESCALAS CUSTOMIZADAS — v2 (reescrita)
+// ══════════════════════════════════════════════════════════════
+// PROBLEMA HISTÓRICO: a escala de um posto era guardada como
+// { semana: [ [turnos dom], [turnos seg], ... [turnos sáb] ] } —
+// um array de 7 arrays. O Firestore REJEITA array-dentro-de-array
+// ("Nested arrays are not supported"), então a gravação na nuvem
+// sempre falhava. Uma correção anterior tentou contornar isso
+// serializando o mapa inteiro como uma string JSON antes de
+// enviar — funcionava, mas criava uma camada extra frágil (fácil
+// esquecer de serializar/desserializar em algum ponto novo) e um
+// dos pontos de gravação ainda tinha uma condição de corrida
+// (gravação direta + fila em paralelo).
+//
+// SOLUÇÃO DEFINITIVA: trocar o formato de armazenamento por uma
+// estrutura NATIVAMENTE compatível com o Firestore — um array
+// PLANO de turnos, cada um marcado com o dia da semana (0-6),
+// em vez de um array de arrays:
+//
+//   custom['Nome do Posto'] = {
+//     turnos: [
+//       { d: 0, e: 360, s: 1080, nd: false, per: 'dia'   },
+//       { d: 1, e: 1020, s: 420, nd: true,  per: 'noite' },
+//       ...
+//     ]
+//   }
+//
+// Isso é mapa → mapa → array → mapa: nunca um array direto dentro
+// de outro array, então nunca mais existe esse erro — e não é mais
+// necessário nenhum JSON.stringify/parse na fronteira com o
+// Firestore. O MESMO formato é usado no localStorage e no
+// Firestore (uma única representação, um único ponto de verdade).
+//
+// Todo o resto do app (editor de turnos, tela de monitoramento,
+// escalas hardcoded) continua trabalhando com o formato antigo
+// "semana" (array de 7 listas) porque é mais conveniente para
+// exibir dia a dia — as funções abaixo convertem entre os dois só
+// nas bordas (armazenamento local/nuvem ↔ uso em memória).
+
+// semana (array de 7 arrays) → turnos (array plano com campo "d")
+function _ftSemanaParaTurnos(semana) {
+  var turnos = [];
+  if (!Array.isArray(semana)) return turnos;
+  semana.forEach(function (dia, idx) {
+    if (!Array.isArray(dia)) return;
+    dia.forEach(function (t) {
+      if (!t) return;
+      turnos.push({
+        d:   idx,
+        e:   t.e,
+        s:   t.s,
+        nd:  !!t.nd,
+        per: t.per === 'noite' ? 'noite' : 'dia'
+      });
+    });
+  });
+  return turnos;
 }
-function _ftDeserializeEscalas(val) {
-  if (typeof val === 'string') {
-    try { return JSON.parse(val); } catch (e) { return {}; }
+
+// turnos (array plano) → semana (array de 7 arrays), para o editor/renderer
+function _ftTurnosParaSemana(turnos) {
+  var semana = [[], [], [], [], [], [], []];
+  if (!Array.isArray(turnos)) return semana;
+  turnos.forEach(function (t) {
+    if (!t) return;
+    var d = parseInt(t.d, 10);
+    if (isNaN(d) || d < 0 || d > 6) return;
+    semana[d].push({ e: t.e, s: t.s, nd: !!t.nd, per: t.per === 'noite' ? 'noite' : 'dia' });
+  });
+  return semana;
+}
+
+// Normaliza UMA entrada de posto, aceitando qualquer formato antigo
+// já gravado por versões anteriores do app:
+//   - { turnos: [...] }               → formato novo, mantém
+//   - { semana: [[...], [...], ...] } → formato antigo com wrapper
+//   - [[...], [...], ...]             → formato antigo "cru" (bem antigo)
+// Sempre retorna { turnos: [...] } (formato novo).
+function _ftNormalizarEntradaEscala(raw) {
+  if (Array.isArray(raw)) return { turnos: _ftSemanaParaTurnos(raw) };
+  if (raw && typeof raw === 'object') {
+    if (Array.isArray(raw.turnos)) return { turnos: raw.turnos.slice() };
+    if (Array.isArray(raw.semana)) return { turnos: _ftSemanaParaTurnos(raw.semana) };
   }
-  if (val && typeof val === 'object') return val; // compat: dado antigo já gravado como objeto
-  return {};
+  return { turnos: [] };
+}
+
+// Normaliza o MAPA inteiro (posto → entrada), aceitando também o caso
+// legado em que o mapa inteiro chegou como uma STRING JSON (versão
+// intermediária que serializava tudo antes de enviar ao Firestore).
+function _ftNormalizarMapaCustom(raw) {
+  if (typeof raw === 'string') {
+    try { raw = JSON.parse(raw); } catch (e) { raw = {}; }
+  }
+  var out = {};
+  if (raw && typeof raw === 'object') {
+    for (var posto in raw) {
+      if (!Object.prototype.hasOwnProperty.call(raw, posto)) continue;
+      out[posto] = _ftNormalizarEntradaEscala(raw[posto]);
+    }
+  }
+  return out;
 }
 
 // ── Stubs: evitam "is not a function" antes do Firebase conectar ──
@@ -7264,7 +7350,7 @@ window._ftFirebaseConectado = false;
         // dispositivo também editou (o mais recente vence).
         if (data['ft_escalas_custom'] !== undefined) {
           var tsEscRemoto = parseInt(data['ft_escalas_custom_ts'] || 0, 10) || 0;
-          var escalasRemotoObj = _ftDeserializeEscalas(data['ft_escalas_custom']);
+          var escalasRemotoObj = _ftNormalizarMapaCustom(data['ft_escalas_custom']);
           if (aplicarSeNovo('ft_escalas_custom', escalasRemotoObj, tsEscRemoto)) {
             if (dadoServidor) chavesUI.push('ft_escalas_custom');
             // Recarrega ESCALAS_POSTOS em memória com os novos dados
@@ -7388,7 +7474,13 @@ window._ftFirebaseConectado = false;
 
     // ── Implementações reais das funções de gravação ──────────
     window._ftSalvarEscalaFirebase = function(custom, ts) {
-      var payload = { ft_escalas_custom: _ftSerializeEscalas(custom) };
+      // Sanitiza antes de enviar: remove undefined/funções (o Firestore
+      // rejeita campos com valor "undefined" com um erro que também
+      // falhava silenciosamente antes). O round-trip JSON garante que só
+      // sobra dado puro (números, strings, booleans, arrays, mapas).
+      var limpo;
+      try { limpo = JSON.parse(JSON.stringify(custom || {})); } catch (e) { limpo = {}; }
+      var payload = { ft_escalas_custom: limpo };
       if (ts) payload['ft_escalas_custom_ts'] = ts;
       db.collection(FIRESTORE_COLLECTION)
         .doc(FIRESTORE_DOC_ID)
@@ -7419,7 +7511,8 @@ window._ftFirebaseConectado = false;
     // ── Função de sync forçado de escala ─────────────────────
     window._ftForceSyncEscala = function() {
       try {
-        var custom = JSON.parse(localStorage.getItem('ft_escalas_custom') || '{}');
+        var raw    = JSON.parse(localStorage.getItem('ft_escalas_custom') || '{}');
+        var custom = _ftNormalizarMapaCustom(raw);
         var ts     = getLocalTs('ft_escalas_custom') || Date.now();
         window._ftSalvarEscalaFirebase(custom, ts);
       } catch(e) {}
@@ -8538,8 +8631,20 @@ window._ftFirebaseConectado = false;
   /* ── Escalas customizadas (localStorage) ──────────────── */
   var LS_ESCALAS_CUSTOM = 'ft_escalas_custom';
 
+  // Lê o mapa de escalas customizadas do localStorage, migrando
+  // automaticamente qualquer formato antigo (array-de-arrays "semana" cru,
+  // ou wrapper { semana: [...] }) para o formato novo { turnos: [...] }.
+  // Se algo precisou ser migrado, já regrava o localStorage no formato novo.
   function loadEscalasCustom() {
-    try { return JSON.parse(localStorage.getItem(LS_ESCALAS_CUSTOM) || '{}'); } catch(e) { return {}; }
+    var raw;
+    try { raw = JSON.parse(localStorage.getItem(LS_ESCALAS_CUSTOM) || '{}'); } catch(e) { raw = {}; }
+    var normalizado = _ftNormalizarMapaCustom(raw);
+    try {
+      if (JSON.stringify(raw) !== JSON.stringify(normalizado)) {
+        localStorage.setItem(LS_ESCALAS_CUSTOM, JSON.stringify(normalizado));
+      }
+    } catch(e) {}
+    return normalizado;
   }
   function saveEscalasCustom(obj) {
     try { localStorage.setItem(LS_ESCALAS_CUSTOM, JSON.stringify(obj)); } catch(e) {}
@@ -8553,13 +8658,15 @@ window._ftFirebaseConectado = false;
   }
 
   // Mescla ESCALAS_POSTOS hardcoded com as customizadas do localStorage
-  // As custom sobrepõem as hardcoded para o mesmo posto
+  // As custom sobrepõem as hardcoded para o mesmo posto. `custom[k]` agora
+  // é sempre { turnos: [...] } (formato novo) — convertemos para o formato
+  // "semana" (array de 7 dias) que o editor/renderer usa em memória.
   function getEscalaEfetiva(postoNome) {
     var custom = loadEscalasCustom();
     var normP = norm(postoNome);
     // Verifica se tem entrada customizada
     for (var k in custom) {
-      if (norm(k) === normP) return { semana: custom[k] };
+      if (norm(k) === normP) return { semana: _ftTurnosParaSemana(custom[k].turnos) };
     }
     // Fallback para hardcoded
     return getEscalaPosto(postoNome);
@@ -8677,7 +8784,7 @@ window._ftFirebaseConectado = false;
   // sobrescrita da escala real do usuário no próximo onSnapshot.
   function salvarEscalaCustomSomenteLocal(postoNome, semana) {
     var custom = loadEscalasCustom();
-    custom[postoNome] = semana;
+    custom[postoNome] = { turnos: _ftSemanaParaTurnos(semana) };
     saveEscalasCustom(custom);
     ESCALAS_POSTOS[postoNome] = { semana: semana };
     // NÃO atualiza ft_escalas_custom_ts e NÃO chama _ftSalvarEscalaFirebase
@@ -8685,7 +8792,7 @@ window._ftFirebaseConectado = false;
 
   function salvarEscalaCustom(postoNome, semana) {
     var custom = loadEscalasCustom();
-    custom[postoNome] = semana;
+    custom[postoNome] = { turnos: _ftSemanaParaTurnos(semana) };
     saveEscalasCustom(custom);
     // Atualiza ESCALAS_POSTOS em memória
     ESCALAS_POSTOS[postoNome] = { semana: semana };
@@ -8694,24 +8801,15 @@ window._ftFirebaseConectado = false;
     //    remoto pode sobrescrever esta edição local ou não.
     var _ts = Date.now();
     try { localStorage.setItem('ft_escalas_custom_ts', String(_ts)); } catch(e) {}
-    // ── RAIZ DO BUG (corrigida agora de verdade): esta função gravava no
-    //    Firestore por DOIS caminhos ao mesmo tempo — uma gravação DIRETA
-    //    (window._ftSalvarEscalaFirebase) e, em paralelo, um enfileiramento
-    //    na fila (FT_SyncQueue). Um comentário aqui já dizia que isso tinha
-    //    sido "corrigido", mas o código continuava chamando os dois. Isso
-    //    cria uma condição de corrida real: ao adicionar dois turnos em
-    //    sequência rápida, a gravação direta do 1º podia terminar DEPOIS
-    //    da gravação (direta ou da fila) do 2º, e o valor mais antigo
-    //    "vencia" no Firestore — o turno recém-adicionado sumia depois de
-    //    sincronizar, e o dispositivo parecia não estar salvando nada.
-    //
-    //    Correção real: um ÚNICO caminho de gravação. A fila processa as
-    //    entradas em ORDEM, uma de cada vez, então não há mais corrida.
-    //    Só usamos a gravação direta como fallback se a fila (IndexedDB)
-    //    não estiver disponível nesta sessão.
+    // ── Um ÚNICO caminho de gravação no Firestore (a fila, que processa em
+    //    ordem — sem corrida com uma gravação direta em paralelo) e um
+    //    formato de dado NATIVAMENTE compatível com o Firestore (array
+    //    plano de turnos, nunca array-dentro-de-array). Ver o bloco de
+    //    comentários no topo do arquivo (_ftNormalizarMapaCustom) para o
+    //    histórico completo do problema.
     if (window.FT_SyncQueue) {
       FT_SyncQueue.enqueue('set', '__escalas_payload__',
-        { ft_escalas_custom: _ftSerializeEscalas(custom), ft_escalas_custom_ts: _ts }
+        { ft_escalas_custom: custom, ft_escalas_custom_ts: _ts }
       ).then(function() {
         if (window.SyncEngine) SyncEngine.flush();
       });
@@ -8797,8 +8895,8 @@ window._ftFirebaseConectado = false;
   // Exposta para o onSnapshot chamar quando recebe escalas de outro dispositivo
   window._ftRecarregarEscalas = function() {
     try {
-      var custom = JSON.parse(localStorage.getItem('ft_escalas_custom') || '{}');
-      for (var k in custom) { ESCALAS_POSTOS[k] = { semana: custom[k] }; }
+      var custom = loadEscalasCustom(); // já normalizado para { turnos: [...] }
+      for (var k in custom) { ESCALAS_POSTOS[k] = { semana: _ftTurnosParaSemana(custom[k].turnos) }; }
     } catch(e) {}
     try { renderEscalaSelectPostos(); } catch(e) {}
     if (_escalaPosToEdit) { try { renderEscalaDiasList(_escalaPosToEdit); } catch(e) {} }
@@ -8898,7 +8996,7 @@ window._ftFirebaseConectado = false;
         // com uma gravação direta em paralelo. Ver comentário em salvarEscalaCustom.
         if (window.FT_SyncQueue) {
           FT_SyncQueue.enqueue('set', '__escalas_payload__',
-            { ft_escalas_custom: _ftSerializeEscalas(custom), ft_escalas_custom_ts: _tsLimpar }
+            { ft_escalas_custom: custom, ft_escalas_custom_ts: _tsLimpar }
           ).then(function() {
             if (window.SyncEngine) SyncEngine.flush();
           });
@@ -8921,7 +9019,7 @@ window._ftFirebaseConectado = false;
   function carregarEscalasCustomNaMemoria() {
     var custom = loadEscalasCustom();
     for (var posto in custom) {
-      ESCALAS_POSTOS[posto] = { semana: custom[posto] };
+      ESCALAS_POSTOS[posto] = { semana: _ftTurnosParaSemana(custom[posto].turnos) };
     }
   }
 
@@ -9817,22 +9915,23 @@ window.diagSync = function () {
     return resultado;
   }
 
-  // Mescla ft_escalas_custom (mapa posto → { semana }) por UNIÃO de turnos
-  // dentro da semana de cada posto, em vez de o objeto inteiro de um posto
-  // sobrescrever o do outro lado. Isso corrige a perda de turnos (ex.:
-  // "Marangoni" ficar só com Noite porque o turno de Dia de um dos
-  // dispositivos era descartado ao mesclar por chave inteira).
+  // Mescla ft_escalas_custom (mapa posto → { turnos: [...] }) por UNIÃO de
+  // turnos dia a dia — nunca descarta um turno que só existe de um dos
+  // lados (ex.: turno de Dia de um dispositivo + turno de Noite do outro).
+  // Convertemos para "semana" só internamente (mais fácil de comparar
+  // dia a dia) e devolvemos já no formato plano "turnos" para gravação.
   function mergeEscalasCustom(local, remoto) {
-    local  = (local  && typeof local  === 'object') ? local  : {};
-    remoto = (remoto && typeof remoto === 'object') ? remoto : {};
+    local  = _ftNormalizarMapaCustom(local);
+    remoto = _ftNormalizarMapaCustom(remoto);
     var chaves = {};
     Object.keys(local).forEach(function (k) { chaves[k] = true; });
     Object.keys(remoto).forEach(function (k) { chaves[k] = true; });
     var out = {};
     Object.keys(chaves).forEach(function (posto) {
-      var semanaLocal  = local[posto]  && local[posto].semana;
-      var semanaRemota = remoto[posto] && remoto[posto].semana;
-      out[posto] = { semana: mergeSemana(semanaLocal, semanaRemota) };
+      var semanaLocal  = _ftTurnosParaSemana(local[posto]  && local[posto].turnos);
+      var semanaRemota = _ftTurnosParaSemana(remoto[posto] && remoto[posto].turnos);
+      var semanaMesclada = mergeSemana(semanaLocal, semanaRemota);
+      out[posto] = { turnos: _ftSemanaParaTurnos(semanaMesclada) };
     });
     return out;
   }
@@ -9918,10 +10017,10 @@ window.diagSync = function () {
       });
 
       // ── Mescla escalas customizadas ──
-      var escLocal  = lerLocal(MAPA, true);
-      var escRemoto = _ftDeserializeEscalas(data[MAPA]);
+      var escLocal  = _ftNormalizarMapaCustom(lerLocal(MAPA, true));
+      var escRemoto = _ftNormalizarMapaCustom(data[MAPA]);
       var escMesclado = mergeEscalasCustom(escLocal, escRemoto);
-      upd[MAPA] = _ftSerializeEscalas(escMesclado);
+      upd[MAPA] = escMesclado;
       gravarLocal(MAPA, escMesclado);
       line('🔀 ' + MAPA + ': ' + Object.keys(escMesclado).length + ' posto(s) com escala customizada', '#26de81');
 
